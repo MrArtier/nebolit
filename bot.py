@@ -207,19 +207,33 @@ application.add_handler(MessageHandler(filters.ALL, handle_message))
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    update = request.get_json(force=True)
-    application.update_queue.put_nowait(update)
-    return "OK"
+    update_json = request.get_json(force=True)
+    update = Update.de_json(update_json, application.bot)
 
-@app.route("/", methods=["GET"])
-def health():
-    return "Bot is running"
+    asyncio.get_event_loop().create_task(
+        application.process_update(update)
+    )
+
+    return "OK"
 
 # ==============================
 # ЗАПУСК
 # ==============================
+import asyncio
+
+async def start_bot():
+    await application.initialize()
+    await application.start()
+
 if __name__ == "__main__":
-    application.initialize()
-    application.bot.set_webhook(WEBHOOK_URL)
+    asyncio.get_event_loop().run_until_complete(start_bot())
+
+    # Установка webhook
+    if WEBHOOK_URL:
+        asyncio.get_event_loop().run_until_complete(
+            application.bot.set_webhook(WEBHOOK_URL)
+        )
+
+    # Порт Cloud Run
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
