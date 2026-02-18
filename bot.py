@@ -287,7 +287,28 @@ def main():
 
     app.add_handler(MessageHandler(filters.ALL, handle_message))
 
-    app.run_polling()
+import os
+from telegram.ext import ApplicationBuilder
+from flask import Flask, request
+
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+app = Flask(__name__)
+
+application = ApplicationBuilder().token(TOKEN).build()
+
+@app.route("/", methods=["POST"])
+def webhook():
+    update = request.get_json(force=True)
+    application.update_queue.put_nowait(update)
+    return "OK"
+
+if __name__ == "__main__":
+    application.initialize()
+    application.bot.set_webhook(WEBHOOK_URL)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 if __name__ == "__main__":
