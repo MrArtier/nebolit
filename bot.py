@@ -3,32 +3,25 @@ import os
 import logging
 import datetime
 import sqlite3
-from dotenv import load_dotenv
 from flask import Flask, request
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from openai import OpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import asyncio
 
 # ==============================
 # НАСТРОЙКА
 # ==============================
-load_dotenv()
-
+logging.basicConfig(level=logging.INFO)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # для Cloud Run
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # URL Cloud Run
 
-if not OPENAI_API_KEY or not TELEGRAM_TOKEN:
-    raise ValueError("❌ OPENAI_API_KEY или TELEGRAM_TOKEN не найдены в .env")
+if not OPENAI_API_KEY or not TELEGRAM_TOKEN or not WEBHOOK_URL:
+    raise ValueError("❌ Не найдены ключи OPENAI_API_KEY, TELEGRAM_TOKEN или WEBHOOK_URL")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-
 MAX_HISTORY = 50
 
 # ==============================
@@ -37,7 +30,6 @@ MAX_HISTORY = 50
 conn = sqlite3.connect("pharmacy_bot.db", check_same_thread=False)
 cursor = conn.cursor()
 
-# Таблицы
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -72,48 +64,45 @@ conn.commit()
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==============================
 def get_user_history(user_id):
-    cursor.execute("""
-        SELECT role, content FROM messages
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-    """, (user_id, MAX_HISTORY))
+    cursor.execute(
+        "SELECT role, content FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        (user_id, MAX_HISTORY)
+    )
     rows = cursor.fetchall()
     rows.reverse()
     return [{"role": role, "content": content} for role, content in rows]
 
 def save_message(user_id, role, content):
-    cursor.execute("""
-        INSERT INTO messages (user_id, role, content, timestamp)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, role, content, str(datetime.datetime.now())))
+    cursor.execute(
+        "INSERT INTO messages (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+        (user_id, role, content, str(datetime.datetime.now()))
+    )
     conn.commit()
 
 def add_or_update_medicine(user_id, name, quantity=1, dosage="", expiry="", category="", target=""):
-    cursor.execute("""
-        SELECT id, quantity FROM inventory
-        WHERE user_id=? AND medicine_name=? AND dosage=? AND category=? AND target_group=?
-    """, (user_id, name, dosage, category, target))
+    cursor.execute(
+        "SELECT id, quantity FROM inventory WHERE user_id=? AND medicine_name=? AND dosage=? AND category=? AND target_group=?",
+        (user_id, name, dosage, category, target)
+    )
     row = cursor.fetchone()
     if row:
         med_id, old_qty = row
-        cursor.execute("""
-            UPDATE inventory SET quantity=?, expiry_date=?
-            WHERE id=?
-        """, (old_qty + quantity, expiry, med_id))
+        cursor.execute(
+            "UPDATE inventory SET quantity=?, expiry_date=? WHERE id=?",
+            (old_qty + quantity, expiry, med_id)
+        )
     else:
-        cursor.execute("""
-            INSERT INTO inventory
-            (user_id, medicine_name, quantity, dosage, expiry_date, category, target_group)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, name, quantity, dosage, expiry, category, target))
+        cursor.execute(
+            "INSERT INTO inventory (user_id, medicine_name, quantity, dosage, expiry_date, category, target_group) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, name, quantity, dosage, expiry, category, target)
+        )
     conn.commit()
 
 def get_inventory(user_id):
-    cursor.execute("""
-        SELECT medicine_name, quantity, dosage, expiry_date, category, target_group
-        FROM inventory WHERE user_id=?
-    """, (user_id,))
+    cursor.execute(
+        "SELECT medicine_name, quantity, dosage, expiry_date, category, target_group FROM inventory WHERE user_id=?",
+        (user_id,)
+    )
     rows = cursor.fetchall()
     meds = []
     for name, qty, dosage, expiry, cat, group in rows:
@@ -128,25 +117,20 @@ def get_inventory(user_id):
     return meds
 
 # ==============================
-# GPT ЗАПРОС
+# GPT RESPONSE
 # ==============================
 async def generate_gpt_response(user_id, user_text):
     history = get_user_history(user_id)
     messages = [{
         "role": "system",
-        "content": (
-            "Ты профессиональный ИИ-ассистент по домашней аптечке. "
-            "Даёшь рекомендации по приёму лекарств и контролю сроков годности. "
-            "Всегда предупреждай: 'Не занимайтесь самолечением, при необходимости обратитесь к врачу.'"
-        )
+        "content": "Ты профессиональный ИИ-ассистент по домашней аптечке. "
+                   "Даёшь рекомендации по приёму лекарств и контролю сроков годности. "
+                   "Всегда предупреждай: 'Не занимайтесь самолечением, при необходимости обратитесь к врачу.'"
     }]
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages
-        )
+        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
         return response.choices[0].message.content
     except Exception as e:
         logging.error(f"Ошибка OpenAI: {e}")
@@ -164,10 +148,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # регистрация
-        cursor.execute("""
-            INSERT OR IGNORE INTO users (user_id, username, created_at)
-            VALUES (?, ?, ?)
-        """, (user_id, user.username, str(datetime.datetime.now())))
+        cursor.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, created_at) VALUES (?, ?, ?)",
+            (user_id, user.username, str(datetime.datetime.now()))
+        )
         conn.commit()
         save_message(user_id, "user", user_text)
 
@@ -185,7 +169,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply = f"✅ Лекарство '{med_name}' добавлено/обновлено."
             except Exception:
                 reply = "⚠️ Формат:\nДобавь Название, Кол-во, Дозировка, ГГГГ-ММ-ДД, Категория, Целевая группа"
-        # сводка аптечки
         elif user_text.lower() in ["аптечка", "сводка"]:
             meds = get_inventory(user_id)
             if not meds:
@@ -194,13 +177,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply = "📋 Содержимое аптечки:\n"
                 for m in meds:
                     reply += f"\n• {m['name']} — {m['quantity']} шт ({m['dosage']}, до {m['expiry_date']})"
-        # запрос к GPT
         else:
             reply = await generate_gpt_response(user_id, user_text)
 
         save_message(user_id, "assistant", reply)
         await update.message.reply_text(reply)
-
     except Exception as e:
         logging.error(f"Ошибка handle_message: {e}")
         await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
@@ -218,24 +199,27 @@ async def post_init(application):
     logging.info("Планировщик запущен")
 
 # ==============================
-# FLASK + WEBHOOK
+# FLASK + TELEGRAM WEBHOOK
 # ==============================
 app = Flask(__name__)
 application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 application.add_handler(MessageHandler(filters.ALL, handle_message))
 
-@app.route("/", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(force=True)
     application.update_queue.put_nowait(update)
     return "OK"
+
+@app.route("/", methods=["GET"])
+def health():
+    return "Bot is running"
 
 # ==============================
 # ЗАПУСК
 # ==============================
 if __name__ == "__main__":
     application.initialize()
-    if WEBHOOK_URL:
-        application.bot.set_webhook(WEBHOOK_URL)
+    application.bot.set_webhook(WEBHOOK_URL)
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
