@@ -9,6 +9,8 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 from openai import OpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import asyncio
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
 # ==============================
 # НАСТРОЙКА
@@ -210,8 +212,9 @@ def webhook():
     update_json = request.get_json(force=True)
     update = Update.de_json(update_json, application.bot)
 
-    asyncio.get_event_loop().create_task(
-        application.process_update(update)
+    asyncio.run_coroutine_threadsafe(
+        application.process_update(update),
+        loop
     )
 
     return "OK"
@@ -219,21 +222,12 @@ def webhook():
 # ==============================
 # ЗАПУСК
 # ==============================
-import asyncio
-
-async def start_bot():
-    await application.initialize()
-    await application.start()
-
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(start_bot())
+    loop.run_until_complete(application.initialize())
+    loop.run_until_complete(application.start())
 
-    # Установка webhook
     if WEBHOOK_URL:
-        asyncio.get_event_loop().run_until_complete(
-            application.bot.set_webhook(WEBHOOK_URL)
-        )
+        loop.run_until_complete(application.bot.set_webhook(WEBHOOK_URL))
 
-    # Порт Cloud Run
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
