@@ -3,14 +3,10 @@ import os
 import logging
 import datetime
 import sqlite3
-from flask import Flask, request
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from openai import OpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import asyncio
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
 
 # ==============================
 # НАСТРОЙКА
@@ -20,8 +16,15 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # URL Cloud Run
 
-if not OPENAI_API_KEY or not TELEGRAM_TOKEN or not WEBHOOK_URL:
-    raise ValueError("❌ Не найдены ключи OPENAI_API_KEY, TELEGRAM_TOKEN или WEBHOOK_URL")
+if not OPENAI_API_KEY:
+    logging.error("OPENAI_API_KEY missing")
+
+if not TELEGRAM_TOKEN:
+    logging.error("TELEGRAM_TOKEN missing")
+
+if not WEBHOOK_URL:
+    logging.error("WEBHOOK_URL missing")
+
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 MAX_HISTORY = 50
@@ -132,7 +135,10 @@ async def generate_gpt_response(user_id, user_text):
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
     try:
-        response = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages
+        )
         return response.choices[0].message.content
     except Exception as e:
         logging.error(f"Ошибка OpenAI: {e}")
@@ -149,15 +155,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user_text:
             return
 
-        # регистрация
         cursor.execute(
             "INSERT OR IGNORE INTO users (user_id, username, created_at) VALUES (?, ?, ?)",
             (user_id, user.username, str(datetime.datetime.now()))
         )
         conn.commit()
+
         save_message(user_id, "user", user_text)
 
-        # добавление лекарства
         if user_text.lower().startswith("добавь"):
             try:
                 parts = user_text[6:].split(",")
@@ -184,6 +189,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         save_message(user_id, "assistant", reply)
         await update.message.reply_text(reply)
+
     except Exception as e:
         logging.error(f"Ошибка handle_message: {e}")
         await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
@@ -203,10 +209,9 @@ async def post_init(application):
 # ==============================
 # FLASK + TELEGRAM WEBHOOK
 # ==============================
-app = Flask(__name__)
 application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 application.add_handler(MessageHandler(filters.ALL, handle_message))
-
+app = Flask(__name__)
 
 # ==============================
 # ЗАПУСК
@@ -220,4 +225,3 @@ if __name__ == "__main__":
         webhook_url=WEBHOOK_URL,
         url_path="webhook"
     )
-
