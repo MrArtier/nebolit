@@ -201,23 +201,30 @@ async def post_init(application):
     logging.info("Планировщик запущен")
 
 # ==============================
-# FLASK + TELEGRAM WEBHOOK
+# ЗАПУСК
 # ==============================
-app = Flask(__name__)
-application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-application.add_handler(MessageHandler(filters.ALL, handle_message))
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    update_json = request.get_json(force=True)
-    update = Update.de_json(update_json, application.bot)
+import threading
 
-    asyncio.run_coroutine_threadsafe(
-        application.process_update(update),
-        loop
-    )
+loop = asyncio.new_event_loop()
 
-    return "OK"
+def start_loop():
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(application.initialize())
+    loop.run_until_complete(application.start())
+
+    if WEBHOOK_URL:
+        loop.run_until_complete(application.bot.set_webhook(WEBHOOK_URL))
+
+    loop.run_forever()
+
+
+if __name__ == "__main__":
+    t = threading.Thread(target=start_loop, daemon=True)
+    t.start()
+
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
 # ==============================
 # ЗАПУСК
