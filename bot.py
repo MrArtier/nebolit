@@ -201,40 +201,23 @@ async def post_init(application):
     logging.info("Планировщик запущен")
 
 # ==============================
-# ЗАПУСК
+# FLASK + TELEGRAM WEBHOOK
 # ==============================
+app = Flask(__name__)
+application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+application.add_handler(MessageHandler(filters.ALL, handle_message))
 
-import threading
-
-loop = asyncio.new_event_loop()
-
-def start_loop():
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(application.initialize())
-    loop.run_until_complete(application.start())
-
-    if WEBHOOK_URL:
-        loop.run_until_complete(application.bot.set_webhook(WEBHOOK_URL))
-
-    loop.run_forever()
-
-
-if __name__ == "__main__":
-    t = threading.Thread(target=start_loop, daemon=True)
-    t.start()
-
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
 
 # ==============================
 # ЗАПУСК
 # ==============================
 if __name__ == "__main__":
-    loop.run_until_complete(application.initialize())
-    loop.run_until_complete(application.start())
-
-    if WEBHOOK_URL:
-        loop.run_until_complete(application.bot.set_webhook(WEBHOOK_URL))
-
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        webhook_url=WEBHOOK_URL,
+        url_path="webhook"
+    )
+
