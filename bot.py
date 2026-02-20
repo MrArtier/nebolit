@@ -1,22 +1,18 @@
-# -*- coding: utf-8 -*-
 import os
 import logging
-import asyncio
 import io
 import re
 import tempfile
 import base64
+import json
+import urllib.request
 import psycopg2
-from flask import Flask, request
+from flask import Flask, request as flask_request
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask
 app = Flask(__name__)
-
-# --- КОНФИГИ (загружаем лениво) ---
 
 def get_config():
     return {
@@ -29,31 +25,15 @@ def get_config():
         "DB_HOST": os.getenv("DB_HOST", ""),
     }
 
-# --- ПОДКЛЮЧЕНИЕ К БАЗЕ ---
-
 def get_db_connection():
     cfg = get_config()
     try:
         if cfg["INSTANCE_CONNECTION_NAME"]:
-            return psycopg2.connect(
-                host=f"/cloudsql/{cfg['INSTANCE_CONNECTION_NAME']}",
-                database=cfg["DB_NAME"],
-                user=cfg["DB_USER"],
-                password=cfg["DB_PASS"],
-                connect_timeout=10
-            )
-        return psycopg2.connect(
-            host=cfg["DB_HOST"],
-            database=cfg["DB_NAME"],
-            user=cfg["DB_USER"],
-            password=cfg["DB_PASS"],
-            connect_timeout=10
-        )
+            return psycopg2.connect(host="/cloudsql/" + cfg["INSTANCE_CONNECTION_NAME"], database=cfg["DB_NAME"], user=cfg["DB_USER"], password=cfg["DB_PASS"], connect_timeout=10)
+        return psycopg2.connect(host=cfg["DB_HOST"], database=cfg["DB_NAME"], user=cfg["DB_USER"], password=cfg["DB_PASS"], connect_timeout=10)
     except Exception as e:
-        logger.error(f"DATABASE CONNECTION ERROR: {e}")
+        logger.error("DB CONNECTION ERROR: %s", e)
         return None
-
-# --- ИНИЦИАЛИЗАЦИЯ БАЗЫ ---
 
 def init_db():
     conn = get_db_connection()
@@ -61,159 +41,89 @@ def init_db():
         logger.error("Cannot connect to DB during init")
         return
     try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT REFERENCES users(user_id),
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS inventory (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT REFERENCES users(user_id),
-                medicine_name TEXT NOT NULL,
-                quantity INTEGER DEFAULT 1,
-                dosage TEXT,
-                expiry_date DATE,
-                category TEXT,
-                target_group TEXT,
-                notes TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS family (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT REFERENCES users(user_id),
-                name TEXT NOT NULL,
-                age INTEGER,
-                gender TEXT,
-                relation TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS reminders (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT REFERENCES users(user_id),
-                family_member TEXT,
-                medicine_name TEXT NOT NULL,
-                schedule TEXT NOT NULL,
-                dosage TEXT,
-                start_date DATE,
-                end_date DATE,
-                active BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+        c = conn.cursor()
+        c.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, user_id BIGINT REFERENCES users(user_id), role TEXT NOT NULL, content TEXT NOT NULL, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS inventory (id SERIAL PRIMARY KEY, user_id BIGINT REFERENCES users(user_id), medicine_name TEXT NOT NULL, quantity INTEGER DEFAULT 1, dosage TEXT, expiry_date DATE, category TEXT, target_group TEXT, notes TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS family (id SERIAL PRIMARY KEY, user_id BIGINT REFERENCES users(user_id), name TEXT NOT NULL, age INTEGER, gender TEXT, relation TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS reminders (id SERIAL PRIMARY KEY, user_id BIGINT REFERENCES users(user_id), family_member TEXT, medicine_name TEXT NOT NULL, schedule TEXT NOT NULL, dosage TEXT, start_date DATE, end_date DATE, active BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         conn.commit()
-        logger.info("Database initialized successfully")
+        logger.info("DB initialized OK")
     except Exception as e:
-        logger.error(f"Init DB error: {e}")
+        logger.error("Init DB error: %s", e)
     finally:
         conn.close()
 
-# --- РАБОТА С БАЗОЙ ---
-
-def save_user(user_id, username):
+def save_user(uid, uname):
     conn = get_db_connection()
     if not conn:
         return
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = %s",
-            (user_id, username, username)
-        )
+        c = conn.cursor()
+        c.execute("INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = %s", (uid, uname, uname))
         conn.commit()
     except Exception as e:
-        logger.error(f"Save user error: {e}")
+        logger.error("Save user error: %s", e)
     finally:
         conn.close()
 
-def save_message(user_id, role, content):
+def save_message(uid, role, content):
     conn = get_db_connection()
     if not conn:
         return
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)",
-            (user_id, role, content)
-        )
+        c = conn.cursor()
+        c.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", (uid, role, content))
         conn.commit()
     except Exception as e:
-        logger.error(f"Save message error: {e}")
+        logger.error("Save msg error: %s", e)
     finally:
         conn.close()
 
-def get_user_history(user_id, limit=20):
+def get_user_history(uid, limit=20):
     conn = get_db_connection()
     if not conn:
         return []
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT role, content FROM messages WHERE user_id = %s ORDER BY timestamp DESC LIMIT %s",
-            (user_id, limit)
-        )
-        rows = cursor.fetchall()
+        c = conn.cursor()
+        c.execute("SELECT role, content FROM messages WHERE user_id = %s ORDER BY timestamp DESC LIMIT %s", (uid, limit))
+        rows = c.fetchall()
         rows.reverse()
         return [{"role": r[0], "content": r[1]} for r in rows]
     except Exception as e:
-        logger.error(f"Get history error: {e}")
+        logger.error("Get history error: %s", e)
         return []
     finally:
         conn.close()
 
-def get_user_inventory(user_id):
+def get_user_inventory(uid):
     conn = get_db_connection()
     if not conn:
         return []
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT medicine_name, quantity, dosage, expiry_date, category, notes FROM inventory WHERE user_id = %s ORDER BY medicine_name",
-            (user_id,)
-        )
-        return cursor.fetchall()
+        c = conn.cursor()
+        c.execute("SELECT medicine_name, quantity, dosage, expiry_date, category, notes FROM inventory WHERE user_id = %s ORDER BY medicine_name", (uid,))
+        return c.fetchall()
     except Exception as e:
-        logger.error(f"Get inventory error: {e}")
+        logger.error("Get inv error: %s", e)
         return []
     finally:
         conn.close()
 
-def get_user_family(user_id):
+def get_user_family(uid):
     conn = get_db_connection()
     if not conn:
         return []
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT name, age, gender, relation FROM family WHERE user_id = %s",
-            (user_id,)
-        )
-        return cursor.fetchall()
+        c = conn.cursor()
+        c.execute("SELECT name, age, gender, relation FROM family WHERE user_id = %s", (uid,))
+        return c.fetchall()
     except Exception as e:
-        logger.error(f"Get family error: {e}")
+        logger.error("Get family error: %s", e)
         return []
     finally:
         conn.close()
-
-# --- РАСПОЗНАВАНИЕ ГОЛОСА (Whisper) ---
-
-def process_voice(voice_bytes):
+        def process_voice(voice_bytes):
     from openai import OpenAI
     cfg = get_config()
     client = OpenAI(api_key=cfg["OPENAI_API_KEY"])
@@ -221,19 +131,13 @@ def process_voice(voice_bytes):
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             tmp.write(voice_bytes)
             tmp_path = tmp.name
-        with open(tmp_path, "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                language="ru"
-            )
+        with open(tmp_path, "rb") as af:
+            transcript = client.audio.transcriptions.create(model="whisper-1", file=af, language="ru")
         os.unlink(tmp_path)
         return transcript.text.strip()
     except Exception as e:
-        logger.error(f"Whisper Error: {e}")
+        logger.error("Whisper Error: %s", e)
         return ""
-
-# --- РАСПОЗНАВАНИЕ ФОТО (GPT Vision) ---
 
 def process_photo_vision(photo_bytes):
     from openai import OpenAI
@@ -241,243 +145,137 @@ def process_photo_vision(photo_bytes):
     client = OpenAI(api_key=cfg["OPENAI_API_KEY"])
     try:
         b64 = base64.b64encode(photo_bytes).decode("utf-8")
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "На фото — упаковка лекарства. Определи:\n"
-                                "1. Название лекарства\n"
-                                "2. Действующее вещество\n"
-                                "3. Дозировка\n"
-                                "4. Срок годности (если виден)\n"
-                                "5. Показания к применению\n"
-                                "6. Категория (обезболивающее, жаропонижающее, антибиотик и т.д.)\n"
-                                "Ответь кратко и структурированно."
-                            )
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            max_tokens=500
-        )
-        return response.choices[0].message.content
+        resp = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": [{"type": "text", "text": "На фото упаковка лекарства. Определи: 1) Название 2) Действующее вещество 3) Дозировка 4) Срок годности 5) Показания 6) Категория. Ответь кратко."}, {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}}]}], max_tokens=500)
+        return resp.choices[0].message.content
     except Exception as e:
-        logger.error(f"Vision Error: {e}")
+        logger.error("Vision Error: %s", e)
         return ""
-
-# --- РАСПОЗНАВАНИЕ ФОТО (OCR fallback) ---
 
 def process_photo_ocr(photo_bytes):
     try:
         from PIL import Image
         import pytesseract
         img = Image.open(io.BytesIO(photo_bytes))
-        text = pytesseract.image_to_string(img, lang='rus+eng')
+        text = pytesseract.image_to_string(img, lang="rus+eng")
         return text.strip()
     except Exception as e:
-        logger.error(f"OCR Error: {e}")
+        logger.error("OCR Error: %s", e)
         return ""
 
-# --- СИСТЕМНЫЙ ПРОМПТ ---
+SYSTEM_PROMPT = "Ты — умный помощник по домашней аптечке. Тебя зовут Аптечка-бот. Задачи: 1) Хранить список лекарств (название, количество, дозировка, срок годности, категория). 2) Подсказывать какое лекарство принять при недомогании. 3) Учитывать состав семьи. 4) Предлагать пополнить аптечку. 5) Собирать мини-аптечку для поездок. 6) Следить за сроками годности. 7) Напоминания о приёме. Правила: рекомендуй ТОЛЬКО из аптечки пользователя. Если нужного нет — скажи купить. Предупреждай что это не замена врачу. Отвечай на русском кратко. Для управления данными используй команды: [ADD_MEDICINE: название | количество | дозировка | срок_годности | категория] [REMOVE_MEDICINE: название] [ADD_FAMILY: имя | возраст | пол | отношение] [ADD_REMINDER: член_семьи | лекарство | расписание | дозировка | начало | конец]"
 
-SYSTEM_PROMPT = """Ты — умный помощник по домашней аптечке. Тебя зовут «Аптечка-бот».
-
-Твои задачи:
-1. Хранить список лекарств пользователя (название, количество, дозировка, срок годности, категория).
-2. Подсказывать, какое лекарство принять при недомогании, в какой дозировке по инструкции.
-3. Учитывать состав семьи (взрослые, дети, мужчины, женщины) при рекомендациях.
-4. Предлагать пополнить аптечку, если чего-то не хватает.
-5. Собирать мини-аптечку для сценариев (поездка на море, дача, поход и т.д.).
-6. Следить за сроками годности и напоминать о просроченных.
-7. Создавать напоминания о приёме лекарств по назначению врача.
-
-ВАЖНЫЕ ПРАВИЛА:
-- Когда пользователь добавляет лекарство (текстом, голосом или фото), ответь подтверждением и ОБЯЗАТЕЛЬНО включи команду [ADD_MEDICINE: ...].
-- Если пользователь спрашивает, что принять — рекомендуй ТОЛЬКО из его аптечки. Если нужного нет — скажи, что стоит купить.
-- Всегда предупреждай: «Это не замена консультации врача».
-- Отвечай на русском, кратко и по делу.
-- Если пользователь присылает фото упаковки, помоги определить лекарство и предложи добавить в аптечку.
-- Если пользователь просит напоминание — уточни: какое лекарство, кому, в какое время, сколько дней.
-
-Для управления данными используй специальные команды в ответе:
-- Добавить лекарство: [ADD_MEDICINE: название | количество | дозировка | срок_годности_ГГГГ-ММ-ДД | категория]
-- Удалить лекарство: [REMOVE_MEDICINE: название]
-- Добавить члена семьи: [ADD_FAMILY: имя | возраст | пол | отношение]
-- Создать напоминание: [ADD_REMINDER: член_семьи | лекарство | расписание | дозировка | дата_начала | дата_окончания]
-"""
-
-# --- GPT ОТВЕТ ---
-
-def generate_gpt_response(user_id, user_text):
+def generate_gpt_response(uid, user_text):
     from openai import OpenAI
     cfg = get_config()
     client = OpenAI(api_key=cfg["OPENAI_API_KEY"])
-
-    history = get_user_history(user_id, limit=20)
-    inventory = get_user_inventory(user_id)
-    family = get_user_family(user_id)
-
+    history = get_user_history(uid, limit=20)
+    inventory = get_user_inventory(uid)
+    family = get_user_family(uid)
+    inv_text = "Аптечка пуста."
     if inventory:
-        inv_lines = []
-        for med in inventory:
-            line = f"- {med[0]}, кол-во: {med[1]}, дозировка: {med[2] or '?'}, годен до: {med[3] or '?'}, категория: {med[4] or '?'}"
-            inv_lines.append(line)
-        inv_text = "\n".join(inv_lines)
-    else:
-        inv_text = "Аптечка пуста."
-
+        lines = []
+        for m in inventory:
+            lines.append("- %s, кол-во: %s, дозировка: %s, годен до: %s, категория: %s" % (m[0], m[1], m[2] or "?", m[3] or "?", m[4] or "?"))
+        inv_text = "\n".join(lines)
+    fam_text = "Состав семьи не указан."
     if family:
-        fam_lines = []
+        lines = []
         for f in family:
-            fam_lines.append(f"- {f[0]}, возраст: {f[1]}, пол: {f[2]}, кто: {f[3]}")
-        fam_text = "\n".join(fam_lines)
-    else:
-        fam_text = "Состав семьи не указан."
-
-    context_message = f"Текущая аптечка пользователя:\n{inv_text}\n\nСостав семьи:\n{fam_text}"
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "system", "content": context_message}
-    ]
+            lines.append("- %s, возраст: %s, пол: %s, кто: %s" % (f[0], f[1], f[2], f[3]))
+        fam_text = "\n".join(lines)
+    ctx = "Текущая аптечка:\n" + inv_text + "\n\nСостав семьи:\n" + fam_text
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "system", "content": ctx}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
-
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            max_tokens=1000,
-            temperature=0.7
-        )
-        reply = response.choices[0].message.content
-        process_gpt_commands(user_id, reply)
-        clean_reply = clean_commands(reply)
-        return clean_reply
+        resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=1000, temperature=0.7)
+        reply = resp.choices[0].message.content
+        process_gpt_commands(uid, reply)
+        return clean_commands(reply)
     except Exception as e:
-        logger.error(f"GPT Error: {e}")
-        return "⚠️ Ошибка связи с ИИ. Попробуй ещё раз."
+        logger.error("GPT Error: %s", e)
+        return "Ошибка связи с ИИ. Попробуй ещё раз."
 
-# --- ОБРАБОТКА КОМАНД GPT ---
-
-def process_gpt_commands(user_id, text):
+def process_gpt_commands(uid, text):
     conn = get_db_connection()
     if not conn:
         return
     try:
-        cursor = conn.cursor()
-
-        add_med = re.findall(r'
-\[ADD_MEDICINE:\s*(.+?)\]', text)
-        for med in add_med:
-            parts = [p.strip() for p in med.split('|')]
+        c = conn.cursor()
+        for med in re.findall(r"
+\[ADD_MEDICINE:\s*(.+?)\]", text):
+            parts = [p.strip() for p in med.split("|")]
             name = parts[0] if len(parts) > 0 else ""
-            qty = parts[1] if len(parts) > 1 else "1"
+            qty = 1
+            if len(parts) > 1:
+                try:
+                    qty = int(parts[1])
+                except ValueError:
+                    qty = 1
             dosage = parts[2] if len(parts) > 2 else None
             expiry = parts[3] if len(parts) > 3 else None
             category = parts[4] if len(parts) > 4 else None
-            try:
-                qty_int = int(qty)
-            except ValueError:
-                qty_int = 1
             if expiry:
-                try:
-                    from datetime import datetime
-                    for fmt in ('%Y-%m-%d', '%d.%m.%Y', '%m/%Y', '%d/%m/%Y'):
-                        try:
-                            parsed = datetime.strptime(expiry, fmt)
-                            expiry = parsed.strftime('%Y-%m-%d')
-                            break
-                        except ValueError:
-                            continue
-                    else:
-                        expiry = None
-                except Exception:
+                from datetime import datetime
+                parsed_ok = False
+                for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%m/%Y", "%d/%m/%Y"):
+                    try:
+                        expiry = datetime.strptime(expiry, fmt).strftime("%Y-%m-%d")
+                        parsed_ok = True
+                        break
+                    except ValueError:
+                        continue
+                if not parsed_ok:
                     expiry = None
             if name:
-                cursor.execute(
-                    "INSERT INTO inventory (user_id, medicine_name, quantity, dosage, expiry_date, category) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (user_id, name, qty_int, dosage, expiry, category)
-                )
-
-        rem_med = re.findall(r'
-\[REMOVE_MEDICINE:\s*(.+?)\]', text)
-        for name in rem_med:
-            cursor.execute(
-                "DELETE FROM inventory WHERE user_id = %s AND LOWER(medicine_name) = LOWER(%s)",
-                (user_id, name.strip())
-            )
-
-        add_fam = re.findall(r'
-\[ADD_FAMILY:\s*(.+?)\]', text)
-        for fam in add_fam:
-            parts = [p.strip() for p in fam.split('|')]
+                c.execute("INSERT INTO inventory (user_id, medicine_name, quantity, dosage, expiry_date, category) VALUES (%s, %s, %s, %s, %s, %s)", (uid, name, qty, dosage, expiry, category))
+        for name in re.findall(r"
+\[REMOVE_MEDICINE:\s*(.+?)\]", text):
+            c.execute("DELETE FROM inventory WHERE user_id = %s AND LOWER(medicine_name) = LOWER(%s)", (uid, name.strip()))
+        for fam in re.findall(r"
+\[ADD_FAMILY:\s*(.+?)\]", text):
+            parts = [p.strip() for p in fam.split("|")]
             name = parts[0] if len(parts) > 0 else ""
-            age = parts[1] if len(parts) > 1 else None
+            age = None
+            if len(parts) > 1:
+                try:
+                    age = int(parts[1])
+                except ValueError:
+                    age = None
             gender = parts[2] if len(parts) > 2 else None
             relation = parts[3] if len(parts) > 3 else None
-            try:
-                age_int = int(age) if age else None
-            except ValueError:
-                age_int = None
             if name:
-                cursor.execute(
-                    "INSERT INTO family (user_id, name, age, gender, relation) VALUES (%s, %s, %s, %s, %s)",
-                    (user_id, name, age_int, gender, relation)
-                )
-
-        add_rem = re.findall(r'
-\[ADD_REMINDER:\s*(.+?)\]', text)
-        for rem in add_rem:
-            parts = [p.strip() for p in rem.split('|')]
+                c.execute("INSERT INTO family (user_id, name, age, gender, relation) VALUES (%s, %s, %s, %s, %s)", (uid, name, age, gender, relation))
+        for rem in re.findall(r"
+\[ADD_REMINDER:\s*(.+?)\]", text):
+            parts = [p.strip() for p in rem.split("|")]
             member = parts[0] if len(parts) > 0 else None
             medicine = parts[1] if len(parts) > 1 else ""
             schedule = parts[2] if len(parts) > 2 else ""
             dosage = parts[3] if len(parts) > 3 else None
-            start_date = parts[4] if len(parts) > 4 else None
-            end_date = parts[5] if len(parts) > 5 else None
+            sd = parts[4] if len(parts) > 4 else None
+            ed = parts[5] if len(parts) > 5 else None
             if medicine and schedule:
-                cursor.execute(
-                    "INSERT INTO reminders (user_id, family_member, medicine_name, schedule, dosage, start_date, end_date) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (user_id, member, medicine, schedule, dosage, start_date, end_date)
-                )
-
+                c.execute("INSERT INTO reminders (user_id, family_member, medicine_name, schedule, dosage, start_date, end_date) VALUES (%s, %s, %s, %s, %s, %s, %s)", (uid, member, medicine, schedule, dosage, sd, ed))
         conn.commit()
     except Exception as e:
-        logger.error(f"Process commands error: {e}")
+        logger.error("Process cmds error: %s", e)
     finally:
         conn.close()
 
 def clean_commands(text):
-    text = re.sub(r'
-\[ADD_MEDICINE:\s*.+?\]', '', text)
-    text = re.sub(r'
-\[REMOVE_MEDICINE:\s*.+?\]', '', text)
-    text = re.sub(r'
-\[ADD_FAMILY:\s*.+?\]', '', text)
-    text = re.sub(r'
-\[ADD_REMINDER:\s*.+?\]', '', text)
+    text = re.sub(r"
+\[ADD_MEDICINE:\s*.+?\]", "", text)
+    text = re.sub(r"
+\[REMOVE_MEDICINE:\s*.+?\]", "", text)
+    text = re.sub(r"
+\[ADD_FAMILY:\s*.+?\]", "", text)
+    text = re.sub(r"
+\[ADD_REMINDER:\s*.+?\]", "", text)
     return text.strip()
-
-# --- TELEGRAM API (без библиотеки, чистые HTTP-запросы) ---
-
-import urllib.request
-import json
-
 def tg_api(method, data=None):
     cfg = get_config()
-    url = f"https://api.telegram.org/bot{cfg['TELEGRAM_TOKEN']}/{method}"
+    url = "https://api.telegram.org/bot" + cfg["TELEGRAM_TOKEN"] + "/" + method
     if data:
         req_data = json.dumps(data).encode("utf-8")
         req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"})
@@ -487,157 +285,116 @@ def tg_api(method, data=None):
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
-        logger.error(f"Telegram API error: {e}")
+        logger.error("TG API error: %s", e)
         return None
 
-def tg_send_message(chat_id, text, parse_mode=None):
-    data = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        data["parse_mode"] = parse_mode
-    return tg_api("sendMessage", data)
+def tg_send(chat_id, text):
+    return tg_api("sendMessage", {"chat_id": chat_id, "text": text})
 
-def tg_get_file(file_id):
+def tg_get_file_bytes(file_id):
     result = tg_api("getFile", {"file_id": file_id})
     if result and result.get("ok"):
-        file_path = result["result"]["file_path"]
+        fp = result["result"]["file_path"]
         cfg = get_config()
-        file_url = f"https://api.telegram.org/file/bot{cfg['TELEGRAM_TOKEN']}/{file_path}"
+        file_url = "https://api.telegram.org/file/bot" + cfg["TELEGRAM_TOKEN"] + "/" + fp
         req = urllib.request.Request(file_url)
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read()
     return None
 
-# --- ОБРАБОТКА ВХОДЯЩИХ СООБЩЕНИЙ ---
-
-def handle_update(update_data):
-    message = update_data.get("message")
-    if not message:
+def handle_update(data):
+    msg = data.get("message")
+    if not msg:
         return
-
-    chat_id = message["chat"]["id"]
-    user_id = message["from"]["id"]
-    username = message["from"].get("username") or message["from"].get("first_name") or ""
-
-    save_user(user_id, username)
-
+    chat_id = msg["chat"]["id"]
+    uid = msg["from"]["id"]
+    uname = msg["from"].get("username") or msg["from"].get("first_name") or ""
+    save_user(uid, uname)
     user_text = ""
-
-    # --- Голосовое сообщение ---
-    if "voice" in message:
-        file_id = message["voice"]["file_id"]
-        voice_bytes = tg_get_file(file_id)
-        if voice_bytes:
-            transcribed = process_voice(voice_bytes)
-            if transcribed:
-                user_text = transcribed
-                tg_send_message(chat_id, f"🎤 Распознано: {transcribed}")
+    if "voice" in msg:
+        vb = tg_get_file_bytes(msg["voice"]["file_id"])
+        if vb:
+            t = process_voice(vb)
+            if t:
+                user_text = t
+                tg_send(chat_id, "Распознано: " + t)
             else:
-                tg_send_message(chat_id, "⚠️ Не удалось распознать голос. Попробуй ещё раз.")
+                tg_send(chat_id, "Не удалось распознать голос.")
                 return
         else:
-            tg_send_message(chat_id, "⚠️ Не удалось скачать голосовое сообщение.")
+            tg_send(chat_id, "Не удалось скачать голосовое.")
             return
-
-    # --- Фото ---
-    elif "photo" in message:
-        photo = message["photo"][-1]
-        file_id = photo["file_id"]
-        photo_bytes = tg_get_file(file_id)
-
-        if photo_bytes:
-            tg_send_message(chat_id, "📷 Анализирую фото...")
-            vision_text = process_photo_vision(photo_bytes)
-            if vision_text:
-                caption = message.get("caption", "")
-                user_text = f"Я сфотографировал упаковку лекарства. Вот что на фото:\n{vision_text}"
-                if caption:
-                    user_text += f"\nМой комментарий: {caption}"
+    elif "photo" in msg:
+        pb = tg_get_file_bytes(msg["photo"][-1]["file_id"])
+        if pb:
+            tg_send(chat_id, "Анализирую фото...")
+            vt = process_photo_vision(pb)
+            if vt:
+                cap = msg.get("caption", "")
+                user_text = "Я сфотографировал упаковку лекарства. Вот что на фото:\n" + vt
+                if cap:
+                    user_text += "\nМой комментарий: " + cap
             else:
-                ocr_text = process_photo_ocr(photo_bytes)
-                if ocr_text:
-                    user_text = f"Я сфотографировал упаковку лекарства. Распознанный текст: {ocr_text}"
+                ot = process_photo_ocr(pb)
+                if ot:
+                    user_text = "Сфотографировал упаковку. Текст: " + ot
                 else:
-                    tg_send_message(chat_id, "⚠️ Не удалось распознать фото. Попробуй сделать снимок чётче.")
+                    tg_send(chat_id, "Не удалось распознать фото.")
                     return
         else:
-            tg_send_message(chat_id, "⚠️ Не удалось скачать фото.")
+            tg_send(chat_id, "Не удалось скачать фото.")
             return
-
-    # --- Текст ---
-    elif "text" in message:
-        user_text = message["text"]
-
+    elif "text" in msg:
+        user_text = msg["text"]
         if user_text.strip() == "/start":
-            welcome = (
-                "👋 Привет! Я — Аптечка-бот.\n\n"
-                "Я помогу тебе:\n"
-                "💊 Вести список лекарств в аптечке\n"
-                "🔍 Подсказать, что принять при недомогании\n"
-                "📷 Распознать лекарство по фото упаковки\n"
-                "🎤 Принять голосовые сообщения\n"
-                "👨‍👩‍👧‍👦 Учитывать членов семьи\n"
-                "⏰ Напоминать о приёме лекарств\n"
-                "📅 Следить за сроками годности\n"
-                "🧳 Собрать аптечку для поездки\n\n"
-                "Просто напиши, что у тебя есть в аптечке, или задай вопрос!"
-            )
-            tg_send_message(chat_id, welcome)
+            tg_send(chat_id, "Привет! Я Аптечка-бот.\n\nЯ помогу тебе:\n- Вести список лекарств\n- Подсказать что принять\n- Распознать лекарство по фото\n- Принять голосовые сообщения\n- Учитывать членов семьи\n- Напоминать о приёме лекарств\n- Следить за сроками годности\n- Собрать аптечку для поездки\n\nПросто напиши что у тебя есть в аптечке или задай вопрос!")
             return
-
         if user_text.strip() == "/inventory":
-            inventory = get_user_inventory(user_id)
-            if inventory:
-                lines = ["📦 Твоя аптечка:\n"]
-                for i, med in enumerate(inventory, 1):
-                    exp = f", годен до {med[3]}" if med[3] else ""
-                    lines.append(f"{i}. {med[0]} — {med[1]} шт., {med[2] or 'дозировка не указана'}{exp}")
-                tg_send_message(chat_id, "\n".join(lines))
+            inv = get_user_inventory(uid)
+            if inv:
+                lines = ["Твоя аптечка:\n"]
+                for i, m in enumerate(inv, 1):
+                    exp = (", годен до " + str(m[3])) if m[3] else ""
+                    lines.append("%d. %s - %s шт., %s%s" % (i, m[0], m[1], m[2] or "дозировка не указана", exp))
+                tg_send(chat_id, "\n".join(lines))
             else:
-                tg_send_message(chat_id, "📦 Аптечка пуста. Отправь фото лекарства или напиши, что у тебя есть!")
+                tg_send(chat_id, "Аптечка пуста. Отправь фото лекарства или напиши что есть!")
             return
-
         if user_text.strip() == "/family":
-            family = get_user_family(user_id)
-            if family:
-                lines = ["👨‍👩‍👧‍👦 Состав семьи:\n"]
-                for f in family:
-                    lines.append(f"- {f[0]}, {f[1]} лет, {f[2]}, {f[3]}")
-                tg_send_message(chat_id, "\n".join(lines))
+            fam = get_user_family(uid)
+            if fam:
+                lines = ["Состав семьи:\n"]
+                for f in fam:
+                    lines.append("- %s, %s лет, %s, %s" % (f[0], f[1], f[2], f[3]))
+                tg_send(chat_id, "\n".join(lines))
             else:
-                tg_send_message(chat_id, "👨‍👩‍👧‍👦 Семья не указана. Напиши, кто в твоей семье!")
+                tg_send(chat_id, "Семья не указана. Напиши кто в твоей семье!")
             return
     else:
         return
-
-    # Сохраняем и генерируем ответ
-    save_message(user_id, "user", user_text)
-    reply = generate_gpt_response(user_id, user_text)
-    save_message(user_id, "assistant", reply)
-    tg_send_message(chat_id, reply)
-
-# --- WEBHOOK ---
+    save_message(uid, "user", user_text)
+    reply = generate_gpt_response(uid, user_text)
+    save_message(uid, "assistant", reply)
+    tg_send(chat_id, reply)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        update_data = request.get_json(force=True)
-        logger.info(f"Received update: {json.dumps(update_data, ensure_ascii=False)[:200]}")
-        handle_update(update_data)
-        return "OK", 200
+        data = flask_request.get_json(force=True)
+        logger.info("Update received")
+        handle_update(data)
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return "OK", 200
+        logger.error("Webhook error: %s", e)
+    return "OK", 200
 
 @app.route("/", methods=["GET"])
 def index():
-    return "Pharmacy Bot is running!", 200
-
-# --- ЗАПУСК ---
+    return "Bot is running!", 200
 
 try:
     init_db()
 except Exception as e:
-    logger.error(f"Init DB failed: {e}")
+    logger.error("Init failed: %s", e)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
