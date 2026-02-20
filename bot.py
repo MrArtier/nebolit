@@ -3,6 +3,10 @@ import os
 import logging
 import datetime
 import sqlite3
+import asyncio
+
+from flask import Flask, request
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from openai import OpenAI
@@ -14,23 +18,20 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(level=logging.INFO)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # URL Cloud Run
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # например: https://xxx.a.run.app/webhook
 
 if not OPENAI_API_KEY:
     logging.error("OPENAI_API_KEY missing")
-
 if not TELEGRAM_TOKEN:
     logging.error("TELEGRAM_TOKEN missing")
-
 if not WEBHOOK_URL:
     logging.error("WEBHOOK_URL missing")
-
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 MAX_HISTORY = 50
 
 # ==============================
-# БАЗА ДАННЫХ
+# БАЗА ДАННЫХ (SQLite: ок для теста, но в Cloud Run не надёжно)
 # ==============================
 conn = sqlite3.connect("pharmacy_bot.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -98,7 +99,8 @@ def add_or_update_medicine(user_id, name, quantity=1, dosage="", expiry="", cate
         )
     else:
         cursor.execute(
-            "INSERT INTO inventory (user_id, medicine_name, quantity, dosage, expiry_date, category, target_group) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO inventory (user_id, medicine_name, quantity, dosage, expiry_date, category, target_group)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
             (user_id, name, quantity, dosage, expiry, category, target)
         )
     conn.commit()
@@ -149,6 +151,9 @@ async def generate_gpt_response(user_id, user_text):
 # ==============================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        if not update.message:
+            return
+
         user = update.message.from_user
         user_id = user.id
         user_text = update.message.text
@@ -192,7 +197,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"Ошибка handle_message: {e}")
-        await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+        if update.message:
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
 
 # ==============================
 # ПЛАНИРОВЩИК
@@ -207,21 +213,56 @@ async def post_init(application):
     logging.info("Планировщик запущен")
 
 # ==============================
-# FLASK + TELEGRAM WEBHOOK
+# TELEGRAM APP
 # ==============================
 application = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 application.add_handler(MessageHandler(filters.ALL, handle_message))
-app = Flask(__name__)
+
+# Инициализацию PTB нужно выполнить один раз
+_app_inited = False
+_init_lock = asyncio.Lock()
+
+async def ensure_inited():
+    global _app_inited
+    if _app_inited:
+        return
+    async with _init_lock:
+        if _app_inited:
+            return
+        await application.initialize()
+        await application.start()
+        _app_inited = True
+        logging.info("Telegram application initialized & started")
 
 # ==============================
-# ЗАПУСК
+# FLASK (Cloud Run entrypoint)
 # ==============================
+flask_app = Flask(__name__)
+
+@flask_app.get("/")
+def health():
+    return "OK", 200
+
+@flask_app.post("/webhook")
+def webhook():
+    update_json = request.get_json(force=True, silent=True)
+    if not update_json:
+        return "Bad Request", 400
+
+    async def _process():
+        await ensure_inited()
+        update = Update.de_json(update_json, application.bot)
+        await application.process_update(update)
+
+    # Запускаем обработку в отдельном event loop для текущего запроса
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_process())
+    finally:
+        loop.close()
+
+    return "OK", 200
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        webhook_url=WEBHOOK_URL,
-        url_path="webhook"
-    )
+    flask_app.run(host="0.0.0.0", port=port, debug=False)
