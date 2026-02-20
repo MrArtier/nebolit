@@ -1,4 +1,12 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    tesseract-ocr-rus \
+    tesseract-ocr-eng \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -7,6 +15,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-ENV PORT=8080
-
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 bot:app
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 120 bot:app
