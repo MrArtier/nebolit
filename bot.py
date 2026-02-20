@@ -150,12 +150,9 @@ def generate_gpt_response(uid, user_text):
     except Exception as e:
         logger.error("GPT err: %s", e)
         return "Ошибка связи с ИИ. Попробуй ещё раз."
-ADD_MED_RE = r"
-\[ADD_MEDICINE:(.+?)\]"
-REM_MED_RE = r"
-\[REMOVE_MEDICINE:(.+?)\]"
-ADD_FAM_RE = r"
-\[ADD_FAMILY:(.+?)\]"
+ADD_MED_RE = r"\[ADD_MEDICINE:(.+?)\]"
+REM_MED_RE = r"\[REMOVE_MEDICINE:(.+?)\]"
+ADD_FAM_RE = r"\[ADD_FAMILY:(.+?)\]"
 def process_gpt_commands(uid, text):
     conn = get_db_connection()
     if not conn:
@@ -314,3 +311,4 @@ except Exception as e:
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
