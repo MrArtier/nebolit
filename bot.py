@@ -121,7 +121,7 @@ def process_photo_vision(photo_bytes):
     except Exception as e:
         logger.error("Vision err: %s", e)
         return ""
-SYSTEM_PROMPT = "Ты умный помощник по домашней аптечке бот НеБолит. Задачи: хранить список лекарств, подсказывать что принять, учитывать семью, предлагать пополнить аптечку, собирать мини-аптечку для поездок, следить за сроками годности, создавать напоминания о приёме лекарств. Рекомендуй ТОЛЬКО из аптечки пользователя. Если нужного нет - скажи купить. Предупреждай что не замена врачу. Отвечай на русском кратко и дружелюбно. Команды: [ADD_MEDICINE:название|количество|дозировка|срок|категория] - добавить лекарство. [REMOVE_MEDICINE:название] - удалить лекарство. [ADD_FAMILY:имя|возраст|пол|отношение] - добавить члена семьи. [ADD_REMINDER:член_семьи|лекарство|время_приёма|до/после/во_время еды|дозировка|дней_курса|таблеток_за_приём|таблеток_в_пачке] - создать напоминание о приёме. Время приёма: 08:00 или 08:00,14:00,20:00 для нескольких раз в день. Если пользователь говорит что врач назначил лекарство - создай напоминание командой ADD_REMINDER. Если курс длинный - предупреди что лекарства может не хватить и посчитай сколько пачек нужно."
+SYSTEM_PROMPT = "Ты умный и дружелюбный помощник по домашней аптечке бот НеБолит. Задачи: хранить список лекарств, подсказывать что принять, учитывать семью, предлагать пополнить аптечку, собирать мини-аптечку для поездок, следить за сроками годности, создавать напоминания о приёме лекарств. При рекомендациях что принять - советуй из аптечки, если нет нужного - скажи что стоит купить. Предупреждай что не замена врачу. Отвечай на русском кратко и дружелюбно. Команды: [ADD_MEDICINE:название|количество|дозировка|срок|категория] - добавить лекарство. [REMOVE_MEDICINE:название] - удалить. [ADD_FAMILY:имя|возраст|пол|отношение] - добавить семью. [ADD_REMINDER:член_семьи|лекарство|время_приёма|до/после/во_время еды|дозировка|дней_курса|таблеток_за_приём|таблеток_в_пачке] - напоминание. ВАЖНО про напоминания: 1) Создавай напоминание даже если лекарства нет в аптечке - пользователь мог быть у врача и ещё не купил. 2) Если лекарство назначено но его нет в аптечке - добавь к ответу что нужно его купить. 3) Слова бессрочно/постоянно/всегда/пожизненно = дней_курса 0 (ноль означает бессрочный приём). 4) Если курс длинный - посчитай сколько таблеток нужно всего и хватит ли имеющихся. Время приёма: 08:00 или 08:00,14:00,20:00 для нескольких раз. Если пользователь говорит что врач назначил - ОБЯЗАТЕЛЬНО создай напоминание. Если лекарства нет в аптечке - всё равно создай напоминание и предупреди купить."
 def generate_gpt_response(uid, user_text):
     from openai import OpenAI
     client = OpenAI(api_key=get_config()["OPENAI_API_KEY"])
@@ -150,7 +150,14 @@ def generate_gpt_response(uid, user_text):
             if rems:
                 rlines = []
                 for r in rems:
-                    rlines.append("- %s %s, приём: %s %s, курс: %s дней, осталось табл: %s" % (r[1], ("для "+r[0]) if r[0] else "", r[3], r[4] or "", r[5] or "?", int(r[8]) if r[8] else "?"))
+                    course_str = "бессрочно" if (r[5] == 0 or r[5] is None) else "%s дней" % r[5]
+                    in_stock = "нет в аптечке"
+                    c3 = conn2.cursor()
+                    c3.execute("SELECT quantity FROM inventory WHERE user_id = %s AND LOWER(medicine_name) = LOWER(%s)", (uid, r[1]))
+                    stock_row = c3.fetchone()
+                    if stock_row:
+                        in_stock = "в аптечке: %s шт" % stock_row[0]
+                    rlines.append("- %s %s, приём: %s %s, курс: %s, %s" % (r[1], ("для "+r[0]) if r[0] else "", r[3], r[4] or "", course_str, in_stock))
                 rem_text = "\n".join(rlines)
         except Exception as e:
             logger.error("Rem ctx err: %s", e)
@@ -236,6 +243,7 @@ def process_gpt_commands(uid, text):
                 from datetime import date, timedelta
                 start = date.today()
                 end = start + timedelta(days=course_days) if course_days > 0 else None
+                total_pills = 0 if course_days == 0 else total_pills
                 times_per_day = len(schedule.split(","))
                 total_pills = course_days * times_per_day * pills_per_dose if course_days > 0 else 0
                 c.execute("INSERT INTO reminders (user_id, family_member, medicine_name, dosage, schedule_time, meal_relation, course_days, pills_per_dose, pills_in_pack, pills_remaining, start_date, end_date, active) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE)", (uid, member, medicine, dosage, schedule, meal, course_days, pills_per_dose, pills_in_pack, total_pills, start, end))
@@ -265,6 +273,10 @@ def tg_api(method, data=None):
         return None
 def tg_send(chat_id, text):
     return tg_api("sendMessage", {"chat_id": chat_id, "text": text})
+def tg_send_with_menu(chat_id, text):
+    keyboard = {"keyboard": [[{"text": "\U0001f3e0 Старт"}, {"text": "\U0001f4e6 Аптечка"}], [{"text": "\U0001f48a Курсы приёма"}, {"text": "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466 Семья"}]], "resize_keyboard": True, "one_time_keyboard": False}
+    return tg_api("sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": keyboard})
+
 def tg_get_file_bytes(file_id):
     result = tg_api("getFile", {"file_id": file_id})
     if result and result.get("ok"):
@@ -354,7 +366,7 @@ def handle_update(data):
                 "\n"
                 "\U000027a1\ufe0f Начни прямо сейчас — напиши что у тебя есть в аптечке, отправь фото или голосовое!"
             )
-            tg_send(chat_id, welcome)
+            tg_send_with_menu(chat_id, welcome)
             return
         if user_text.strip() == "/reminders":
             conn = get_db_connection()
@@ -376,6 +388,8 @@ def handle_update(data):
                                 line += "\n   \U0001f4ca %s" % r[2]
                             if r[5] and r[5] > 0:
                                 line += "\n   \U0001f4c5 Курс: %s дней (%s - %s)" % (r[5], r[6], r[7])
+                            elif r[5] == 0 or r[5] is None:
+                                line += "\n   \U0001f504 Бессрочный приём"
                             if r[8] and r[8] > 0:
                                 line += "\n   \U0001f4a6 Осталось таблеток: %s" % int(r[8])
                             lines.append(line)
@@ -413,6 +427,14 @@ def handle_update(data):
             return
     else:
         return
+    if user_text == "\U0001f3e0 Старт":
+        user_text = "/start"
+    elif user_text == "\U0001f4e6 Аптечка":
+        user_text = "/inventory"
+    elif user_text == "\U0001f48a Курсы приёма":
+        user_text = "/reminders"
+    elif user_text == "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466 Семья":
+        user_text = "/family"
     save_message(uid, "user", user_text)
     reply = generate_gpt_response(uid, user_text)
     save_message(uid, "assistant", reply)
