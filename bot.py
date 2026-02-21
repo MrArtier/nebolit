@@ -25,7 +25,10 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS inventory (id SERIAL PRIMARY KEY, user_id BIGINT, medicine_name TEXT NOT NULL, quantity INTEGER DEFAULT 1, dosage TEXT, expiry_date DATE, category TEXT, notes TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS family (id SERIAL PRIMARY KEY, user_id BIGINT, name TEXT NOT NULL, age INTEGER, gender TEXT, relation TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS reminders (id SERIAL PRIMARY KEY, user_id BIGINT, family_member TEXT, medicine_name TEXT NOT NULL, dosage TEXT, schedule_time TEXT NOT NULL, meal_relation TEXT DEFAULT '', course_days INTEGER DEFAULT 0, pills_per_dose REAL DEFAULT 1, pills_in_pack INTEGER DEFAULT 0, pills_remaining REAL DEFAULT 0, start_date DATE, end_date DATE, active BOOLEAN DEFAULT TRUE, last_reminded TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS shared_access (id SERIAL PRIMARY KEY, owner_id BIGINT NOT NULL, shared_with_id BIGINT NOT NULL, shared_with_username TEXT, relation TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(owner_id, shared_with_id))")
         c.execute("CREATE TABLE IF NOT EXISTS reminder_log (id SERIAL PRIMARY KEY, reminder_id INTEGER REFERENCES reminders(id), sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, status TEXT DEFAULT 'sent')")
+        c.execute("DELETE FROM reminders WHERE medicine_name IN ('лекарство','medicine','test') OR family_member IN ('член_семьи','member')")
+        c.execute("DELETE FROM family WHERE name IN ('имя','name','test') OR gender IN ('пол','gender') OR relation IN ('отношение','relation')")
         conn.commit()
         logger.info("DB init OK")
     except Exception as e:
@@ -121,7 +124,7 @@ def process_photo_vision(photo_bytes):
     except Exception as e:
         logger.error("Vision err: %s", e)
         return ""
-SYSTEM_PROMPT = "Ты умный и дружелюбный помощник по домашней аптечке бот НеБолит. Задачи: хранить список лекарств, подсказывать что принять, учитывать семью, предлагать пополнить аптечку, собирать мини-аптечку для поездок, следить за сроками годности, создавать напоминания о приёме лекарств. При рекомендациях что принять - советуй из аптечки, если нет нужного - скажи что стоит купить. Предупреждай что не замена врачу. Отвечай на русском кратко и дружелюбно. Команды: [ADD_MEDICINE:название|количество|дозировка|срок|категория] - добавить лекарство. [REMOVE_MEDICINE:название] - удалить. [ADD_FAMILY:имя|возраст|пол|отношение] - добавить семью. [ADD_REMINDER:член_семьи|лекарство|время_приёма|до/после/во_время еды|дозировка|дней_курса|таблеток_за_приём|таблеток_в_пачке] - напоминание. ВАЖНО про напоминания: 1) Создавай напоминание даже если лекарства нет в аптечке - пользователь мог быть у врача и ещё не купил. 2) Если лекарство назначено но его нет в аптечке - добавь к ответу что нужно его купить. 3) Слова бессрочно/постоянно/всегда/пожизненно = дней_курса 0 (ноль означает бессрочный приём). 4) Если курс длинный - посчитай сколько таблеток нужно всего и хватит ли имеющихся. Время приёма: 08:00 или 08:00,14:00,20:00 для нескольких раз. Если пользователь говорит что врач назначил - ОБЯЗАТЕЛЬНО создай напоминание. Если лекарства нет в аптечке - всё равно создай напоминание и предупреди купить."
+SYSTEM_PROMPT = "Ты умный и дружелюбный помощник по домашней аптечке бот НеБолит. Задачи: хранить список лекарств, подсказывать что принять, учитывать семью, предлагать пополнить аптечку, собирать мини-аптечку для поездок, следить за сроками годности, создавать напоминания о приёме лекарств. При рекомендациях что принять - советуй из аптечки, если нет нужного - скажи что стоит купить. Предупреждай что не замена врачу. Отвечай на русском кратко и дружелюбно. Команды: [ADD_MEDICINE:название|количество|дозировка|срок|категория] - добавить лекарство. [REMOVE_MEDICINE:название] - удалить. [ADD_FAMILY:имя|возраст|пол|отношение] - добавить семью. [ADD_REMINDER:член_семьи|лекарство|время_приёма|до/после/во_время еды|дозировка|дней_курса|таблеток_за_приём|таблеток_в_пачке] - напоминание. ВАЖНО про напоминания: 1) Создавай напоминание даже если лекарства нет в аптечке - пользователь мог быть у врача и ещё не купил. 2) Если лекарство назначено но его нет в аптечке - добавь к ответу что нужно его купить. 3) Слова бессрочно/постоянно/всегда/пожизненно = дней_курса 0 (ноль означает бессрочный приём). 4) Если курс длинный - посчитай сколько таблеток нужно всего и хватит ли имеющихся. Время приёма: 08:00 или 08:00,14:00,20:00 для нескольких раз. Если пользователь говорит что врач назначил - ОБЯЗАТЕЛЬНО создай напоминание. Если лекарства нет в аптечке - всё равно создай напоминание и предупреди купить. НИКОГДА не подставляй шаблонные значения типа член_семьи/лекарство/время_приёма/дозировка - используй только реальные данные из сообщения пользователя. Если пользователь не указал для кого - оставь поле члена семьи пустым. Если не указал время - спроси. Связка аптечек: если пользователь хочет поделиться аптечкой с родственником через его @username в телеграме - используй команду [SHARE_ACCESS:@username|отношение]. Тогда оба будут видеть общую аптечку."
 def generate_gpt_response(uid, user_text):
     from openai import OpenAI
     client = OpenAI(api_key=get_config()["OPENAI_API_KEY"])
@@ -179,6 +182,7 @@ ADD_MED_RE = r"\[ADD_MEDICINE:(.+?)\]"
 REM_MED_RE = r"\[REMOVE_MEDICINE:(.+?)\]"
 ADD_FAM_RE = r"\[ADD_FAMILY:(.+?)\]"
 ADD_REM_RE = r"\[ADD_REMINDER:(.+?)\]"
+SHARE_RE = r"\[SHARE_ACCESS:(.+?)\]"
 def process_gpt_commands(uid, text):
     conn = get_db_connection()
     if not conn:
@@ -214,6 +218,12 @@ def process_gpt_commands(uid, text):
             relation = parts[3] if len(parts) > 3 else None
             if name:
                 c.execute("INSERT INTO family (user_id, name, age, gender, relation) VALUES (%s,%s,%s,%s,%s)", (uid, name, age, gender, relation))
+        for sh in re.findall(SHARE_RE, text):
+            parts = [p.strip() for p in sh.split("|")]
+            username = parts[0].replace("@", "") if len(parts) > 0 else ""
+            relation = parts[1] if len(parts) > 1 else ""
+            if username:
+                c.execute("INSERT INTO shared_access (owner_id, shared_with_id, shared_with_username, relation) VALUES (%s, 0, %s, %s) ON CONFLICT DO NOTHING", (uid, username, relation))
         for rem in re.findall(ADD_REM_RE, text):
             parts = [p.strip() for p in rem.split("|")]
             member = parts[0] if len(parts) > 0 else ""
@@ -257,6 +267,7 @@ def clean_commands(text):
     text = re.sub(REM_MED_RE, "", text)
     text = re.sub(ADD_FAM_RE, "", text)
     text = re.sub(ADD_REM_RE, "", text)
+    text = re.sub(SHARE_RE, "", text)
     return text.strip()
 def tg_api(method, data=None):
     cfg = get_config()
@@ -420,7 +431,15 @@ def handle_update(data):
             if fam:
                 lines = ["Семья:\n"]
                 for f in fam:
-                    lines.append("- %s, %s лет, %s, %s" % (f[0], f[1], f[2], f[3]))
+                    age_str = "%s лет" % f[1] if f[1] else "возраст не указан"
+                    gender_str = f[2] if f[2] else ""
+                    rel_str = f[3] if f[3] else ""
+                    parts = [f[0], age_str]
+                    if gender_str:
+                        parts.append(gender_str)
+                    if rel_str:
+                        parts.append(rel_str)
+                    lines.append("- %s" % ", ".join(parts))
                 tg_send(chat_id, "\n".join(lines))
             else:
                 tg_send(chat_id, "Семья не указана.")
