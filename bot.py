@@ -24,6 +24,8 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, user_id BIGINT, role TEXT NOT NULL, content TEXT NOT NULL, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS inventory (id SERIAL PRIMARY KEY, user_id BIGINT, medicine_name TEXT NOT NULL, quantity INTEGER DEFAULT 1, dosage TEXT, expiry_date DATE, category TEXT, notes TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS family (id SERIAL PRIMARY KEY, user_id BIGINT, name TEXT NOT NULL, age INTEGER, gender TEXT, relation TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS reminders (id SERIAL PRIMARY KEY, user_id BIGINT, family_member TEXT, medicine_name TEXT NOT NULL, dosage TEXT, schedule_time TEXT NOT NULL, meal_relation TEXT DEFAULT '', course_days INTEGER DEFAULT 0, pills_per_dose REAL DEFAULT 1, pills_in_pack INTEGER DEFAULT 0, pills_remaining REAL DEFAULT 0, start_date DATE, end_date DATE, active BOOLEAN DEFAULT TRUE, last_reminded TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS reminder_log (id SERIAL PRIMARY KEY, reminder_id INTEGER REFERENCES reminders(id), sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, status TEXT DEFAULT 'sent')")
         conn.commit()
         logger.info("DB init OK")
     except Exception as e:
@@ -119,7 +121,7 @@ def process_photo_vision(photo_bytes):
     except Exception as e:
         logger.error("Vision err: %s", e)
         return ""
-SYSTEM_PROMPT = "Ты умный помощник по домашней аптечке Аптечка-бот. Задачи: хранить список лекарств, подсказывать что принять, учитывать семью, предлагать пополнить аптечку, собирать мини-аптечку для поездок, следить за сроками годности. Рекомендуй ТОЛЬКО из аптечки пользователя. Если нужного нет - скажи купить. Предупреждай что не замена врачу. Отвечай на русском кратко. Когда пользователь добавляет лекарство включи команду [ADD_MEDICINE:название|количество|дозировка|срок|категория]. Удалить: [REMOVE_MEDICINE:название]. Добавить семью: [ADD_FAMILY:имя|возраст|пол|отношение]."
+SYSTEM_PROMPT = "Ты умный помощник по домашней аптечке бот НеБолит. Задачи: хранить список лекарств, подсказывать что принять, учитывать семью, предлагать пополнить аптечку, собирать мини-аптечку для поездок, следить за сроками годности, создавать напоминания о приёме лекарств. Рекомендуй ТОЛЬКО из аптечки пользователя. Если нужного нет - скажи купить. Предупреждай что не замена врачу. Отвечай на русском кратко и дружелюбно. Команды: [ADD_MEDICINE:название|количество|дозировка|срок|категория] - добавить лекарство. [REMOVE_MEDICINE:название] - удалить лекарство. [ADD_FAMILY:имя|возраст|пол|отношение] - добавить члена семьи. [ADD_REMINDER:член_семьи|лекарство|время_приёма|до/после/во_время еды|дозировка|дней_курса|таблеток_за_приём|таблеток_в_пачке] - создать напоминание о приёме. Время приёма: 08:00 или 08:00,14:00,20:00 для нескольких раз в день. Если пользователь говорит что врач назначил лекарство - создай напоминание командой ADD_REMINDER. Если курс длинный - предупреди что лекарства может не хватить и посчитай сколько пачек нужно."
 def generate_gpt_response(uid, user_text):
     from openai import OpenAI
     client = OpenAI(api_key=get_config()["OPENAI_API_KEY"])
@@ -138,7 +140,23 @@ def generate_gpt_response(uid, user_text):
         for f in family:
             lines.append("- %s, %s лет, %s, %s" % (f[0], f[1], f[2], f[3]))
         fam_text = "\n".join(lines)
-    ctx = "Аптечка:\n" + inv_text + "\nСемья:\n" + fam_text
+    rem_text = "Напоминаний нет."
+    conn2 = get_db_connection()
+    if conn2:
+        try:
+            c2 = conn2.cursor()
+            c2.execute("SELECT family_member, medicine_name, dosage, schedule_time, meal_relation, course_days, start_date, end_date, pills_remaining FROM reminders WHERE user_id = %s AND active = TRUE", (uid,))
+            rems = c2.fetchall()
+            if rems:
+                rlines = []
+                for r in rems:
+                    rlines.append("- %s %s, приём: %s %s, курс: %s дней, осталось табл: %s" % (r[1], ("для "+r[0]) if r[0] else "", r[3], r[4] or "", r[5] or "?", int(r[8]) if r[8] else "?"))
+                rem_text = "\n".join(rlines)
+        except Exception as e:
+            logger.error("Rem ctx err: %s", e)
+        finally:
+            conn2.close()
+    ctx = "Аптечка:\n" + inv_text + "\nСемья:\n" + fam_text + "\nНапоминания:\n" + rem_text
     messages = [{"role":"system","content":SYSTEM_PROMPT},{"role":"system","content":ctx}]
     messages.extend(history)
     messages.append({"role":"user","content":user_text})
@@ -153,6 +171,7 @@ def generate_gpt_response(uid, user_text):
 ADD_MED_RE = r"\[ADD_MEDICINE:(.+?)\]"
 REM_MED_RE = r"\[REMOVE_MEDICINE:(.+?)\]"
 ADD_FAM_RE = r"\[ADD_FAMILY:(.+?)\]"
+ADD_REM_RE = r"\[ADD_REMINDER:(.+?)\]"
 def process_gpt_commands(uid, text):
     conn = get_db_connection()
     if not conn:
@@ -188,6 +207,38 @@ def process_gpt_commands(uid, text):
             relation = parts[3] if len(parts) > 3 else None
             if name:
                 c.execute("INSERT INTO family (user_id, name, age, gender, relation) VALUES (%s,%s,%s,%s,%s)", (uid, name, age, gender, relation))
+        for rem in re.findall(ADD_REM_RE, text):
+            parts = [p.strip() for p in rem.split("|")]
+            member = parts[0] if len(parts) > 0 else ""
+            medicine = parts[1] if len(parts) > 1 else ""
+            schedule = parts[2] if len(parts) > 2 else "08:00"
+            meal = parts[3] if len(parts) > 3 else ""
+            dosage = parts[4] if len(parts) > 4 else ""
+            course_days = 0
+            if len(parts) > 5:
+                try:
+                    course_days = int(parts[5])
+                except ValueError:
+                    course_days = 0
+            pills_per_dose = 1.0
+            if len(parts) > 6:
+                try:
+                    pills_per_dose = float(parts[6])
+                except ValueError:
+                    pills_per_dose = 1.0
+            pills_in_pack = 0
+            if len(parts) > 7:
+                try:
+                    pills_in_pack = int(parts[7])
+                except ValueError:
+                    pills_in_pack = 0
+            if medicine:
+                from datetime import date, timedelta
+                start = date.today()
+                end = start + timedelta(days=course_days) if course_days > 0 else None
+                times_per_day = len(schedule.split(","))
+                total_pills = course_days * times_per_day * pills_per_dose if course_days > 0 else 0
+                c.execute("INSERT INTO reminders (user_id, family_member, medicine_name, dosage, schedule_time, meal_relation, course_days, pills_per_dose, pills_in_pack, pills_remaining, start_date, end_date, active) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE)", (uid, member, medicine, dosage, schedule, meal, course_days, pills_per_dose, pills_in_pack, total_pills, start, end))
         conn.commit()
     except Exception as e:
         logger.error("Cmd err: %s", e)
@@ -197,6 +248,7 @@ def clean_commands(text):
     text = re.sub(ADD_MED_RE, "", text)
     text = re.sub(REM_MED_RE, "", text)
     text = re.sub(ADD_FAM_RE, "", text)
+    text = re.sub(ADD_REM_RE, "", text)
     return text.strip()
 def tg_api(method, data=None):
     cfg = get_config()
@@ -303,6 +355,40 @@ def handle_update(data):
                 "\U000027a1\ufe0f Начни прямо сейчас — напиши что у тебя есть в аптечке, отправь фото или голосовое!"
             )
             tg_send(chat_id, welcome)
+            return
+        if user_text.strip() == "/reminders":
+            conn = get_db_connection()
+            if conn:
+                try:
+                    c = conn.cursor()
+                    c.execute("SELECT family_member, medicine_name, dosage, schedule_time, meal_relation, course_days, start_date, end_date, pills_remaining FROM reminders WHERE user_id = %s AND active = TRUE ORDER BY schedule_time", (uid,))
+                    rems = c.fetchall()
+                    if rems:
+                        lines = ["\U0001f4cb Активные напоминания:\n"]
+                        for r in rems:
+                            line = "\U0001f48a %s" % r[1]
+                            if r[0]:
+                                line += " (для %s)" % r[0]
+                            line += "\n   \U000023f0 %s" % r[3]
+                            if r[4]:
+                                line += " %s" % r[4]
+                            if r[2]:
+                                line += "\n   \U0001f4ca %s" % r[2]
+                            if r[5] and r[5] > 0:
+                                line += "\n   \U0001f4c5 Курс: %s дней (%s - %s)" % (r[5], r[6], r[7])
+                            if r[8] and r[8] > 0:
+                                line += "\n   \U0001f4a6 Осталось таблеток: %s" % int(r[8])
+                            lines.append(line)
+                        tg_send(chat_id, "\n".join(lines))
+                    else:
+                        tg_send(chat_id, "Нет активных напоминаний.")
+                except Exception as e:
+                    logger.error("Reminders err: %s", e)
+                    tg_send(chat_id, "Ошибка при загрузке напоминаний.")
+                finally:
+                    conn.close()
+            else:
+                tg_send(chat_id, "Ошибка подключения к базе.")
             return
         if user_text.strip() == "/inventory":
             inv = get_user_inventory(uid)
