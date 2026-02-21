@@ -2,6 +2,15 @@
 from flask import Flask, request as flask_request
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def md_to_html(text):
+    import re as _re
+    text = _re.sub(r'\*\*\*(.+?)\*\*\*', r'<b><i>\1</i></b>', text)
+    text = _re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    text = _re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
+    text = _re.sub(r'__(.+?)__', r'<u>\1</u>', text)
+    text = _re.sub(r'`(.+?)`', r'<code>\1</code>', text)
+    return text
 app = Flask(__name__)
 def get_config():
     return {"OPENAI_API_KEY": os.getenv("OPENAI_API_KEY",""), "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN",""), "DB_NAME": os.getenv("DB_NAME",""), "DB_USER": os.getenv("DB_USER",""), "DB_PASS": os.getenv("DB_PASS",""), "INSTANCE_CONNECTION_NAME": os.getenv("INSTANCE_CONNECTION_NAME",""), "DB_HOST": os.getenv("DB_HOST","")}
@@ -283,10 +292,18 @@ def tg_api(method, data=None):
         logger.error("TG err: %s", e)
         return None
 def tg_send(chat_id, text):
-    return tg_api("sendMessage", {"chat_id": chat_id, "text": text})
+    html_text = md_to_html(text)
+    try:
+        return tg_api("sendMessage", {"chat_id": chat_id, "text": html_text, "parse_mode": "HTML"})
+    except:
+        return tg_api("sendMessage", {"chat_id": chat_id, "text": text})
 def tg_send_with_menu(chat_id, text):
     keyboard = {"keyboard": [[{"text": "\U0001f3e0 Старт"}, {"text": "\U0001f4e6 Аптечка"}], [{"text": "\U0001f48a Курсы приёма"}, {"text": "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466 Семья"}]], "resize_keyboard": True, "one_time_keyboard": False}
-    return tg_api("sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": keyboard})
+    html_text = md_to_html(text)
+    try:
+        return tg_api("sendMessage", {"chat_id": chat_id, "text": html_text, "parse_mode": "HTML", "reply_markup": keyboard})
+    except:
+        return tg_api("sendMessage", {"chat_id": chat_id, "text": text, "reply_markup": keyboard})
 
 def tg_get_file_bytes(file_id):
     result = tg_api("getFile", {"file_id": file_id})
