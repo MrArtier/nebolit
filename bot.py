@@ -34,7 +34,13 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS inventory (id SERIAL PRIMARY KEY, user_id BIGINT, medicine_name TEXT NOT NULL, quantity INTEGER DEFAULT 1, dosage TEXT, expiry_date DATE, category TEXT, notes TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS family (id SERIAL PRIMARY KEY, user_id BIGINT, name TEXT NOT NULL, age INTEGER, gender TEXT, relation TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS reminders (id SERIAL PRIMARY KEY, user_id BIGINT, family_member TEXT, medicine_name TEXT NOT NULL, dosage TEXT, schedule_time TEXT NOT NULL, meal_relation TEXT DEFAULT '', course_days INTEGER DEFAULT 0, pills_per_dose REAL DEFAULT 1, pills_in_pack INTEGER DEFAULT 0, pills_remaining REAL DEFAULT 0, start_date DATE, end_date DATE, active BOOLEAN DEFAULT TRUE, last_reminded TIMESTAMP, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS cabinets (id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, name TEXT NOT NULL DEFAULT 'Моя аптечка', is_default BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         c.execute("CREATE TABLE IF NOT EXISTS shared_access (id SERIAL PRIMARY KEY, owner_id BIGINT NOT NULL, shared_with_id BIGINT NOT NULL, shared_with_username TEXT, relation TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(owner_id, shared_with_id))")
+        try:
+            c.execute("ALTER TABLE inventory ADD COLUMN IF NOT EXISTS cabinet_id INTEGER DEFAULT 0")
+        except:
+            pass
+        c.execute("CREATE TABLE IF NOT EXISTS user_state (user_id BIGINT PRIMARY KEY, active_cabinet_id INTEGER DEFAULT 0)")
         c.execute("CREATE TABLE IF NOT EXISTS reminder_log (id SERIAL PRIMARY KEY, reminder_id INTEGER REFERENCES reminders(id), sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, status TEXT DEFAULT 'sent')")
         c.execute("DELETE FROM reminders WHERE medicine_name IN ('лекарство','medicine','test') OR family_member IN ('член_семьи','member')")
         c.execute("DELETE FROM family WHERE name IN ('имя','name','test') OR gender IN ('пол','gender') OR relation IN ('отношение','relation')")
@@ -83,6 +89,51 @@ def get_user_history(uid, limit=20):
         return []
     finally:
         conn.close()
+def get_active_cabinet(uid):
+    conn = get_db_connection()
+    if not conn:
+        return 0, "Моя аптечка"
+    try:
+        c = conn.cursor()
+        c.execute("SELECT active_cabinet_id FROM user_state WHERE user_id = %s", (uid,))
+        row = c.fetchone()
+        cab_id = row[0] if row else 0
+        if cab_id > 0:
+            c.execute("SELECT name FROM cabinets WHERE id = %s", (cab_id,))
+            cab = c.fetchone()
+            return cab_id, cab[0] if cab else "Моя аптечка"
+        return 0, "Моя аптечка"
+    except:
+        return 0, "Моя аптечка"
+    finally:
+        conn.close()
+
+def set_active_cabinet(uid, cab_id):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        c = conn.cursor()
+        c.execute("INSERT INTO user_state (user_id, active_cabinet_id) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET active_cabinet_id = %s", (uid, cab_id, cab_id))
+        conn.commit()
+    except:
+        pass
+    finally:
+        conn.close()
+
+def get_user_cabinets(uid):
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        c = conn.cursor()
+        c.execute("SELECT id, name, is_default FROM cabinets WHERE user_id = %s ORDER BY id", (uid,))
+        return c.fetchall()
+    except:
+        return []
+    finally:
+        conn.close()
+
 def get_user_inventory(uid):
     conn = get_db_connection()
     if not conn:
@@ -133,7 +184,7 @@ def process_photo_vision(photo_bytes):
     except Exception as e:
         logger.error("Vision err: %s", e)
         return ""
-SYSTEM_PROMPT = "Ты умный и дружелюбный помощник по домашней аптечке бот НеБолит. Задачи: хранить список лекарств, подсказывать что принять, учитывать семью, предлагать пополнить аптечку, собирать мини-аптечку для поездок, следить за сроками годности, создавать напоминания о приёме лекарств. При рекомендациях что принять - советуй из аптечки, если нет нужного - скажи что стоит купить. Предупреждай что не замена врачу. Отвечай на русском кратко и дружелюбно. Команды: [ADD_MEDICINE:название|количество|дозировка|срок|категория] - добавить лекарство. [REMOVE_MEDICINE:название] - удалить. [ADD_FAMILY:имя|возраст|пол|отношение] - добавить семью. [ADD_REMINDER:член_семьи|лекарство|время_приёма|до/после/во_время еды|дозировка|дней_курса|таблеток_за_приём|таблеток_в_пачке] - напоминание. ВАЖНО про напоминания: 1) Создавай напоминание даже если лекарства нет в аптечке - пользователь мог быть у врача и ещё не купил. 2) Если лекарство назначено но его нет в аптечке - добавь к ответу что нужно его купить. 3) Слова бессрочно/постоянно/всегда/пожизненно = дней_курса 0 (ноль означает бессрочный приём). 4) Если курс длинный - посчитай сколько таблеток нужно всего и хватит ли имеющихся. Время приёма: 08:00 или 08:00,14:00,20:00 для нескольких раз. Если пользователь говорит что врач назначил - ОБЯЗАТЕЛЬНО создай напоминание. Если лекарства нет в аптечке - всё равно создай напоминание и предупреди купить. НИКОГДА не подставляй шаблонные значения типа член_семьи/лекарство/время_приёма/дозировка - используй только реальные данные из сообщения пользователя. Если пользователь не указал для кого - оставь поле члена семьи пустым. Если не указал время - спроси. Связка аптечек: если пользователь хочет поделиться аптечкой с родственником через его @username в телеграме - используй команду [SHARE_ACCESS:@username|отношение]. Тогда оба будут видеть общую аптечку."
+SYSTEM_PROMPT = "Ты умный и дружелюбный помощник по домашней аптечке бот НеБолит. Задачи: хранить список лекарств, подсказывать что принять, учитывать семью, предлагать пополнить аптечку, собирать мини-аптечку для поездок, следить за сроками годности, создавать напоминания о приёме лекарств. При рекомендациях что принять - советуй из аптечки, если нет нужного - скажи что стоит купить. Предупреждай что не замена врачу. Отвечай на русском кратко и дружелюбно. Команды: [ADD_MEDICINE:название|количество|дозировка|срок|категория] - добавить лекарство. КАТЕГОРИИ определяй сам на основе своих знаний о лекарстве: ТЕМПЕРАТУРА (жаропонижающие, противопростудные), БОЛЬ (обезболивающие, спазмолитики), ЖИВОТ (ЖКТ, пищеварение), РАНЫ (антисептики, бинты, пластыри, мази для кожи), РАЗНОЕ (аллергия, сердце, давление, витамины и всё остальное). НИКОГДА не спрашивай категорию у пользователя - определяй сам. Также определяй правильное название лекарства, типовую дозировку если пользователь не указал. [REMOVE_MEDICINE:название] - удалить. [ADD_FAMILY:имя|возраст|пол|отношение] - добавить семью. [ADD_REMINDER:член_семьи|лекарство|время_приёма|до/после/во_время еды|дозировка|дней_курса|таблеток_за_приём|таблеток_в_пачке] - напоминание. ВАЖНО про напоминания: 1) Создавай напоминание даже если лекарства нет в аптечке - пользователь мог быть у врача и ещё не купил. 2) Если лекарство назначено но его нет в аптечке - добавь к ответу что нужно его купить. 3) Слова бессрочно/постоянно/всегда/пожизненно = дней_курса 0 (ноль означает бессрочный приём). 4) Если курс длинный - посчитай сколько таблеток нужно всего и хватит ли имеющихся. Время приёма: 08:00 или 08:00,14:00,20:00 для нескольких раз. Если пользователь говорит что врач назначил - ОБЯЗАТЕЛЬНО создай напоминание. Если лекарства нет в аптечке - всё равно создай напоминание и предупреди купить. При добавлении лекарства: 1) Определи правильное полное название. 2) Если пользователь не указал дозировку - подставь стандартную (например Нурофен = 200мг, Парацетамол = 500мг). 3) Категорию определи сам. 4) Если количество не указано - поставь 1. 5) Если срок не указан - поставь пустую строку. НИКОГДА не подставляй шаблонные значения типа член_семьи/лекарство/время_приёма/дозировка - используй только реальные данные из сообщения пользователя. Если пользователь не указал для кого - оставь поле члена семьи пустым. Если не указал время - спроси. Связка аптечек: если пользователь хочет поделиться аптечкой с родственником через его @username в телеграме - используй команду [SHARE_ACCESS:@username|отношение]. Множественные аптечки: пользователь может вести несколько аптечек (свою, мамы, папы и т.д.). Команды: [CREATE_CABINET:название] - создать новую аптечку. [SWITCH_CABINET:название] - переключиться на другую аптечку. По умолчанию лекарства добавляются в текущую активную аптечку. Если пользователь говорит добавить лекарство в конкретную аптечку - сначала переключи, потом добавь."
 def generate_gpt_response(uid, user_text):
     from openai import OpenAI
     client = OpenAI(api_key=get_config()["OPENAI_API_KEY"])
@@ -152,6 +203,11 @@ def generate_gpt_response(uid, user_text):
         for f in family:
             lines.append("- %s, %s лет, %s, %s" % (f[0], f[1], f[2], f[3]))
         fam_text = "\n".join(lines)
+    cab_id, cab_name = get_active_cabinet(uid)
+    cab_text = "Текущая аптечка: %s" % cab_name
+    cabs = get_user_cabinets(uid)
+    if cabs:
+        cab_text += ". Все аптечки: " + ", ".join([c[1] for c in cabs])
     rem_text = "Напоминаний нет."
     conn2 = get_db_connection()
     if conn2:
@@ -175,7 +231,7 @@ def generate_gpt_response(uid, user_text):
             logger.error("Rem ctx err: %s", e)
         finally:
             conn2.close()
-    ctx = "Аптечка:\n" + inv_text + "\nСемья:\n" + fam_text + "\nНапоминания:\n" + rem_text
+    ctx = cab_text + "\nАптечка:\n" + inv_text + "\nСемья:\n" + fam_text + "\nНапоминания:\n" + rem_text
     messages = [{"role":"system","content":SYSTEM_PROMPT},{"role":"system","content":ctx}]
     messages.extend(history)
     messages.append({"role":"user","content":user_text})
@@ -192,6 +248,8 @@ REM_MED_RE = r"\[REMOVE_MEDICINE:(.+?)\]"
 ADD_FAM_RE = r"\[ADD_FAMILY:(.+?)\]"
 ADD_REM_RE = r"\[ADD_REMINDER:(.+?)\]"
 SHARE_RE = r"\[SHARE_ACCESS:(.+?)\]"
+CABINET_CREATE_RE = r"\[CREATE_CABINET:(.+?)\]"
+CABINET_SWITCH_RE = r"\[SWITCH_CABINET:(.+?)\]"
 def process_gpt_commands(uid, text):
     conn = get_db_connection()
     if not conn:
@@ -227,6 +285,21 @@ def process_gpt_commands(uid, text):
             relation = parts[3] if len(parts) > 3 else None
             if name:
                 c.execute("INSERT INTO family (user_id, name, age, gender, relation) VALUES (%s,%s,%s,%s,%s)", (uid, name, age, gender, relation))
+        for cab in re.findall(CABINET_CREATE_RE, text):
+            cab_name = cab.strip()
+            if cab_name:
+                c.execute("INSERT INTO cabinets (user_id, name) VALUES (%s, %s) RETURNING id", (uid, cab_name))
+                new_id = c.fetchone()[0]
+                c.execute("INSERT INTO user_state (user_id, active_cabinet_id) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET active_cabinet_id = %s", (uid, new_id, new_id))
+        for cab in re.findall(CABINET_SWITCH_RE, text):
+            cab_name = cab.strip()
+            if cab_name:
+                c.execute("SELECT id FROM cabinets WHERE user_id = %s AND LOWER(name) LIKE LOWER(%s)", (uid, "%" + cab_name + "%"))
+                row = c.fetchone()
+                if row:
+                    c.execute("INSERT INTO user_state (user_id, active_cabinet_id) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET active_cabinet_id = %s", (uid, row[0], row[0]))
+                elif cab_name.lower() in ("моя аптечка", "своя", "моя", "основная", "домашняя"):
+                    c.execute("INSERT INTO user_state (user_id, active_cabinet_id) VALUES (%s, 0) ON CONFLICT (user_id) DO UPDATE SET active_cabinet_id = 0", (uid,))
         for sh in re.findall(SHARE_RE, text):
             parts = [p.strip() for p in sh.split("|")]
             username = parts[0].replace("@", "") if len(parts) > 0 else ""
@@ -277,6 +350,8 @@ def clean_commands(text):
     text = re.sub(ADD_FAM_RE, "", text)
     text = re.sub(ADD_REM_RE, "", text)
     text = re.sub(SHARE_RE, "", text)
+    text = re.sub(CABINET_CREATE_RE, "", text)
+    text = re.sub(CABINET_SWITCH_RE, "", text)
     return text.strip()
 def tg_api(method, data=None):
     cfg = get_config()
@@ -298,7 +373,7 @@ def tg_send(chat_id, text):
     except:
         return tg_api("sendMessage", {"chat_id": chat_id, "text": text})
 def tg_send_with_menu(chat_id, text):
-    keyboard = {"keyboard": [[{"text": "\U0001f3e0 Старт"}, {"text": "\U0001f4e6 Аптечка"}], [{"text": "\U0001f48a Курсы приёма"}, {"text": "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466 Семья"}]], "resize_keyboard": True, "one_time_keyboard": False}
+    keyboard = {"keyboard": [[{"text": "\U0001f3e0 Старт"}, {"text": "\U0001f4e6 Аптечка"}], [{"text": "\U0001f48a Курсы приёма"}, {"text": "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466 Семья"}], [{"text": "\U0001f3e0 Аптечки"}]], "resize_keyboard": True, "one_time_keyboard": False}
     html_text = md_to_html(text)
     try:
         return tg_api("sendMessage", {"chat_id": chat_id, "text": html_text, "parse_mode": "HTML", "reply_markup": keyboard})
@@ -396,6 +471,22 @@ def handle_update(data):
             )
             tg_send_with_menu(chat_id, welcome)
             return
+        if user_text.strip() == "/cabinets":
+            cabs = get_user_cabinets(uid)
+            cab_id, cab_name = get_active_cabinet(uid)
+            lines = ["\U0001f3e0 Ваши аптечки:\n"]
+            if not cabs:
+                lines.append("\U0001f4e6 Моя аптечка (по умолчанию) \u2705")
+            else:
+                for cb in cabs:
+                    mark = " \u2705" if cb[0] == cab_id else ""
+                    lines.append("\U0001f4e6 %s (id:%s)%s" % (cb[1], cb[0], mark))
+                if cab_id == 0:
+                    lines.append("\U0001f4e6 Моя аптечка (по умолчанию) \u2705")
+            lines.append("\n\U0001f4ac Чтобы создать: \"Создай аптечку для мамы\"")
+            lines.append("\U0001f504 Чтобы переключить: \"Переключи на аптечку мамы\"")
+            tg_send(chat_id, "\n".join(lines))
+            return
         if user_text.strip() == "/reminders":
             conn = get_db_connection()
             if conn:
@@ -434,8 +525,9 @@ def handle_update(data):
             return
         if user_text.strip() == "/inventory":
             inv = get_user_inventory(uid)
+            cab_id_d, cab_name_d = get_active_cabinet(uid)
             if inv:
-                lines = ["Твоя аптечка:\n"]
+                lines = ["\U0001f4e6 %s:\n" % cab_name_d]
                 for i, m in enumerate(inv, 1):
                     exp = (", годен до " + str(m[3])) if m[3] else ""
                     lines.append("%d. %s - %s шт., %s%s" % (i, m[0], m[1], m[2] or "?", exp))
@@ -471,6 +563,8 @@ def handle_update(data):
         user_text = "/reminders"
     elif user_text == "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466 Семья":
         user_text = "/family"
+    elif user_text == "\U0001f3e0 Аптечки":
+        user_text = "/cabinets"
     save_message(uid, "user", user_text)
     reply = generate_gpt_response(uid, user_text)
     save_message(uid, "assistant", reply)
