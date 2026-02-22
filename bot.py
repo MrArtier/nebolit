@@ -73,6 +73,10 @@ def init_db():
         except:
             pass
         c.execute("CREATE TABLE IF NOT EXISTS user_state (user_id BIGINT PRIMARY KEY, active_cabinet_id INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS subscriptions (id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL UNIQUE, plan TEXT DEFAULT 'free', started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMP, trial_used BOOLEAN DEFAULT FALSE, payment_id TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS payments (id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, payment_id TEXT UNIQUE, amount DECIMAL(10,2), status TEXT DEFAULT 'pending', promo_code TEXT, discount_percent INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, confirmed_at TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS promo_codes (id SERIAL PRIMARY KEY, code TEXT UNIQUE NOT NULL, action TEXT DEFAULT 'discount', discount_percent INTEGER DEFAULT 0, free_days INTEGER DEFAULT 0, max_uses INTEGER DEFAULT 0, used_count INTEGER DEFAULT 0, active BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        c.execute("CREATE TABLE IF NOT EXISTS promo_usage (id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, promo_id INTEGER REFERENCES promo_codes(id), used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id, promo_id))")
         c.execute("CREATE TABLE IF NOT EXISTS reminder_log (id SERIAL PRIMARY KEY, reminder_id INTEGER REFERENCES reminders(id), sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, status TEXT DEFAULT 'sent')")
         c.execute("DELETE FROM reminders WHERE medicine_name IN ('лекарство','medicine','test') OR family_member IN ('член_семьи','member')")
         c.execute("DELETE FROM family WHERE name IN ('имя','name','test') OR gender IN ('пол','gender') OR relation IN ('отношение','relation')")
@@ -121,6 +125,115 @@ def get_user_history(uid, limit=20):
         return []
     finally:
         conn.close()
+def get_subscription(uid):
+    conn = get_db_connection()
+    if not conn:
+        return {"plan": "free", "active": False, "trial": False, "days_left": 0}
+    try:
+        c = conn.cursor()
+        c.execute("SELECT plan, started_at, expires_at, trial_used FROM subscriptions WHERE user_id = %s", (uid,))
+        row = c.fetchone()
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        if not row:
+            c.execute("INSERT INTO subscriptions (user_id, plan, started_at, expires_at, trial_used) VALUES (%s, 'trial', %s, %s, FALSE)", (uid, now, now + timedelta(days=TRIAL_DAYS)))
+            conn.commit()
+            return {"plan": "trial", "active": True, "trial": True, "days_left": TRIAL_DAYS}
+        plan, started, expires, trial_used = row
+        if plan == "paid" and expires and expires > now:
+            days_left = (expires - now).days
+            return {"plan": "paid", "active": True, "trial": False, "days_left": days_left}
+        if plan == "trial" and expires and expires > now:
+            days_left = (expires - now).days
+            return {"plan": "trial", "active": True, "trial": True, "days_left": days_left}
+        return {"plan": "expired", "active": False, "trial": trial_used, "days_left": 0}
+    except Exception as e:
+        logger.error("Sub err: %s", e)
+        return {"plan": "free", "active": False, "trial": False, "days_left": 0}
+    finally:
+        conn.close()
+
+def activate_subscription(uid, days, payment_id=None):
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        c = conn.cursor()
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        expires = now + timedelta(days=days)
+        c.execute("INSERT INTO subscriptions (user_id, plan, started_at, expires_at, trial_used, payment_id) VALUES (%s, 'paid', %s, %s, TRUE, %s) ON CONFLICT (user_id) DO UPDATE SET plan='paid', started_at=%s, expires_at=%s, trial_used=TRUE, payment_id=%s", (uid, now, expires, payment_id, now, expires, payment_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error("Activate err: %s", e)
+        return False
+    finally:
+        conn.close()
+
+def check_promo(code_text):
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        c = conn.cursor()
+        c.execute("SELECT id, code, action, discount_percent, free_days, max_uses, used_count FROM promo_codes WHERE UPPER(code) = UPPER(%s) AND active = TRUE", (code_text,))
+        row = c.fetchone()
+        if not row:
+            return None
+        promo_id, code, action, discount, free_days, max_uses, used_count = row
+        if max_uses > 0 and used_count >= max_uses:
+            return None
+        return {"id": promo_id, "code": code, "action": action, "discount": discount, "free_days": free_days}
+    except:
+        return None
+    finally:
+        conn.close()
+
+def use_promo(uid, promo_id):
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        c = conn.cursor()
+        c.execute("SELECT id FROM promo_usage WHERE user_id = %s AND promo_id = %s", (uid, promo_id))
+        if c.fetchone():
+            return False
+        c.execute("INSERT INTO promo_usage (user_id, promo_id) VALUES (%s, %s)", (uid, promo_id))
+        c.execute("UPDATE promo_codes SET used_count = used_count + 1 WHERE id = %s", (promo_id,))
+        conn.commit()
+        return True
+    except:
+        return False
+    finally:
+        conn.close()
+
+def create_yukassa_payment(uid, amount, description="Подписка НеБолит на 1 год"):
+    import urllib.request
+    import base64
+    auth = base64.b64encode(("%s:%s" % (YUKASSA_SHOP_ID, YUKASSA_SECRET_KEY)).encode()).decode()
+    import uuid
+    idempotence_key = str(uuid.uuid4())
+    body = json.dumps({"amount": {"value": str(amount), "currency": "RUB"}, "confirmation": {"type": "redirect", "return_url": "https://t.me/NeBolitBot"}, "capture": True, "description": description, "metadata": {"user_id": str(uid)}})
+    req = urllib.request.Request("https://api.yookassa.ru/v3/payments", data=body.encode(), headers={"Content-Type": "application/json", "Authorization": "Basic " + auth, "Idempotence-Key": idempotence_key})
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = json.loads(resp.read().decode())
+        payment_id = data.get("id", "")
+        pay_url = data.get("confirmation", {}).get("confirmation_url", "")
+        conn = get_db_connection()
+        if conn:
+            try:
+                c = conn.cursor()
+                c.execute("INSERT INTO payments (user_id, payment_id, amount, status) VALUES (%s, %s, %s, 'pending') ON CONFLICT (payment_id) DO NOTHING", (uid, payment_id, amount))
+                conn.commit()
+            finally:
+                conn.close()
+        return payment_id, pay_url
+    except Exception as e:
+        logger.error("YuKassa err: %s", e)
+        return None, None
+
 def get_active_cabinet(uid):
     conn = get_db_connection()
     if not conn:
@@ -483,6 +596,66 @@ def handle_update(data):
             return
     elif "text" in msg:
         user_text = msg["text"]
+        sub = get_subscription(uid)
+        if user_text.strip().upper().startswith("NB-") or user_text.strip().upper().startswith("NEBOLIT"):
+            promo = check_promo(user_text.strip())
+            if promo:
+                already_used = not use_promo(uid, promo["id"])
+                if already_used:
+                    tg_send(chat_id, "\u274c Вы уже использовали этот промокод.")
+                    return
+                if promo["action"] == "discount":
+                    price = int(SUBSCRIPTION_PRICE * (100 - promo["discount"]) / 100)
+                    payment_id, pay_url = create_yukassa_payment(uid, price, "Подписка НеБолит (скидка %s%%)" % promo["discount"])
+                    if pay_url:
+                        conn_pr = get_db_connection()
+                        if conn_pr:
+                            try:
+                                c_pr = conn_pr.cursor()
+                                c_pr.execute("UPDATE payments SET promo_code=%s, discount_percent=%s WHERE payment_id=%s", (promo["code"], promo["discount"], payment_id))
+                                conn_pr.commit()
+                            finally:
+                                conn_pr.close()
+                        tg_send(chat_id, "\U0001f389 Промокод принят! Скидка %s%%\n\U0001f4b0 Цена: %s \u20bd (вместо %s \u20bd)\n\n\U0001f449 Оплатите по ссылке:\n%s" % (promo["discount"], price, SUBSCRIPTION_PRICE, pay_url))
+                    else:
+                        tg_send(chat_id, "\u274c Ошибка создания платежа. Попробуйте позже.")
+                    return
+                elif promo["action"] == "free_days":
+                    activate_subscription(uid, promo["free_days"])
+                    tg_send(chat_id, "\U0001f389 Промокод принят! Вам подарено %s дней бесплатного доступа!" % promo["free_days"])
+                    return
+                elif promo["action"] == "full_free":
+                    activate_subscription(uid, 365)
+                    tg_send(chat_id, "\U0001f389 Промокод принят! Подписка на год активирована бесплатно!")
+                    return
+            else:
+                pass
+        if user_text.strip() == "/subscribe":
+            if sub["plan"] == "paid" and sub["active"]:
+                tg_send(chat_id, "\u2705 У вас уже есть активная подписка! Осталось дней: %s" % sub["days_left"])
+                return
+            payment_id, pay_url = create_yukassa_payment(uid, SUBSCRIPTION_PRICE)
+            if pay_url:
+                tg_send(chat_id, "\U0001f48a Подписка НеБолит на 1 год\n\U0001f4b0 Стоимость: %s \u20bd\n\n\U0001f449 Оплатите по ссылке:\n%s\n\nПосле оплаты доступ активируется автоматически!" % (SUBSCRIPTION_PRICE, pay_url))
+            else:
+                tg_send(chat_id, "\u274c Ошибка создания платежа. Попробуйте позже.")
+            return
+        if user_text.strip() == "/status":
+            if sub["plan"] == "paid":
+                tg_send(chat_id, "\u2705 Подписка активна! Осталось %s дней." % sub["days_left"])
+            elif sub["plan"] == "trial":
+                tg_send(chat_id, "\U0001f552 Пробный период. Осталось %s дней.\n\nДля оплаты: /subscribe" % sub["days_left"])
+            else:
+                tg_send(chat_id, "\u274c Подписка неактивна.\n\nДля оплаты: /subscribe")
+            return
+        if not sub["active"] and user_text.strip() not in ["/start", "/subscribe", "/status"]:
+            is_free_query = any(w in user_text.lower() for w in ["что такое", "для чего", "от чего", "зачем", "описание", "инструкция", "побочные", "аналог"])
+            if not is_free_query:
+                if sub.get("trial"):
+                    tg_send(chat_id, "\u23f0 Пробный период закончился.\n\nВам доступны бесплатные справки о лекарствах. Для полного доступа оформите подписку: /subscribe")
+                else:
+                    tg_send(chat_id, "\U0001f512 Эта функция доступна по подписке.\n\nВам доступны бесплатные справки о лекарствах. Для полного доступа: /subscribe")
+                return
         if user_text.strip() == "/start":
             welcome = (
                 "\U0001f48a Привет! Я бот НеБолит — твой персональный помощник по домашней аптечке.\n"
@@ -523,6 +696,13 @@ def handle_update(data):
                 "\n"
                 "\U000027a1\ufe0f Начни прямо сейчас — напиши что у тебя есть в аптечке, отправь фото или голосовое!"
             )
+            sub_info = get_subscription(uid)
+            if sub_info["plan"] == "paid":
+                welcome += "\n\n\u2705 Подписка активна (%s дн.)" % sub_info["days_left"]
+            elif sub_info["plan"] == "trial":
+                welcome += "\n\n\U0001f552 Пробный период (%s дн.). /subscribe для оплаты" % sub_info["days_left"]
+            else:
+                welcome += "\n\n\U0001f512 Подписка неактивна. /subscribe для оплаты"
             tg_send_with_menu(chat_id, welcome)
             return
         if user_text.strip() == "/cabinets":
