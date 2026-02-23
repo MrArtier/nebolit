@@ -688,7 +688,10 @@ def handle_update(data):
                 finally:
                     conn_a.close()
             return
-        sub = get_subscription(uid)
+        if uid == ADMIN_ID:
+            sub = {"plan": "paid", "active": True, "trial": False, "days_left": 999}
+        else:
+            sub = get_subscription(uid)
         if user_text.strip().upper().startswith("NB-") or user_text.strip().upper().startswith("NEBOLIT"):
             promo = check_promo(user_text.strip())
             if promo:
@@ -740,9 +743,9 @@ def handle_update(data):
             else:
                 tg_send(chat_id, "\u274c Подписка неактивна.\n\nДля оплаты: /subscribe")
             return
-        if not sub["active"] and user_text.strip() not in ["/start", "/subscribe", "/status"]:
+        if not sub["active"]:
             is_free_query = any(w in user_text.lower() for w in ["что такое", "для чего", "от чего", "зачем", "описание", "инструкция", "побочные", "аналог"])
-            if not is_free_query:
+            if not is_free_query and user_text.strip() not in ["/start"]:
                 if sub.get("trial"):
                     tg_send(chat_id, "\u23f0 Пробный период закончился.\n\nВам доступны бесплатные справки о лекарствах. Для полного доступа оформите подписку: /subscribe")
                 else:
