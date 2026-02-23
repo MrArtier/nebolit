@@ -596,6 +596,16 @@ def handle_update(data):
             return
     elif "text" in msg:
         user_text = msg["text"]
+        if user_text == "\U0001f3e0 Старт" or user_text == "\U0001f4aa Навести порядок":
+            user_text = "/start"
+        elif user_text == "\U0001f4e6 Аптечка":
+            user_text = "/inventory"
+        elif user_text == "\U0001f48a Курсы приёма":
+            user_text = "/reminders"
+        elif user_text == "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466 Семья":
+            user_text = "/family"
+        elif user_text == "\U0001f3e0 Аптечки":
+            user_text = "/cabinets"
         if user_text.strip() == "/admin" and uid == ADMIN_ID:
             conn_a = get_db_connection()
             if conn_a:
@@ -974,20 +984,6 @@ def handle_update(data):
             else:
                 tg_send(chat_id, "Семья не указана.")
             return
-    else:
-        return
-    if user_text == "\U0001f3e0 Старт":
-        user_text = "/start"
-    elif user_text == "\U0001f4e6 Аптечка":
-        user_text = "/inventory"
-    elif user_text == "\U0001f48a Курсы приёма":
-        user_text = "/reminders"
-    elif user_text == "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466 Семья":
-        user_text = "/family"
-    elif user_text == "\U0001f3e0 Аптечки":
-        user_text = "/cabinets"
-    elif user_text == "\U0001f4aa Навести порядок":
-        user_text = "/start"
     save_message(uid, "user", user_text)
     reply = generate_gpt_response(uid, user_text)
     save_message(uid, "assistant", reply)
