@@ -1007,31 +1007,6 @@ def cleanup_db():
     finally:
         conn.close()
 
-@app.route("/cleanup_db", methods=["GET"])
-def cleanup_db():
-    conn = get_db_connection()
-    if not conn:
-        return "DB connection FAILED", 500
-    try:
-        c = conn.cursor()
-        # Удалить не-лекарства из inventory
-        c.execute("DELETE FROM inventory WHERE LOWER(medicine_name) IN ('лев', 'циньян', 'ян', 'анна')")
-        inv_del = c.rowcount
-        # Удалить дубли из family
-        c.execute("""DELETE FROM family WHERE id NOT IN (
-            SELECT MIN(id) FROM family GROUP BY user_id, LOWER(name)
-        )""")
-        fam_dedup = c.rowcount
-        # Удалить шаблонные записи
-        c.execute("DELETE FROM family WHERE LOWER(name) IN ('имя','name','test','член_семьи')")
-        fam_tpl = c.rowcount
-        conn.commit()
-        return "Cleanup done. Inv removed: %s, Family deduped: %s, Family templates: %s" % (inv_del, fam_dedup, fam_tpl), 200
-    except Exception as e:
-        return "Error: %s" % str(e), 500
-    finally:
-        conn.close()
-
 @app.route("/debug_db", methods=["GET"])
 def debug_db():
     conn = get_db_connection()
