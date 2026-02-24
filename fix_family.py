@@ -1,85 +1,122 @@
-# fix_family.py - чистим шаблоны семьи и добавляем диагностику
+# fix_family.py - добавляем REMOVE_FAMILY, EDIT_FAMILY, чистим мусор
 with open("bot.py", "r", encoding="utf-8") as f:
     code = f.read()
 
-# 1. Добавить диагностику семьи в debug_db
-old_debug = '''        c.execute("SELECT * FROM inventory ORDER BY id DESC LIMIT 3")
-        recent = c.fetchall()
-        return "DB OK. Users: %s, Msgs: %s, Inv: %s\\nColumns: %s\\nRecent: %s" % (users, msgs, inv, col_str, str(recent)), 200'''
+# 1. Добавить регулярки для REMOVE_FAMILY и EDIT_FAMILY
+old_re = 'CABINET_SWITCH_RE = r"\
+\[SWITCH_CABINET:(.+?)\\]"'
+new_re = '''CABINET_SWITCH_RE = r"\
+\[SWITCH_CABINET:(.+?)\\]"
+REM_FAM_RE = r"\
+\[REMOVE_FAMILY:(.+?)\\]"'''
+code = code.replace(old_re, new_re)
 
-new_debug = '''        c.execute("SELECT * FROM inventory ORDER BY id DESC LIMIT 3")
-        recent = c.fetchall()
-        c.execute("SELECT COUNT(*) FROM family")
-        fam_count = c.fetchone()[0]
-        c.execute("SELECT * FROM family ORDER BY id DESC LIMIT 10")
-        fam_recent = c.fetchall()
-        c.execute("SELECT content FROM messages WHERE content LIKE '%%ADD_FAMILY%%' ORDER BY id DESC LIMIT 5")
-        fam_msgs = c.fetchall()
-        return "DB OK. Users: %s, Msgs: %s, Inv: %s\\nColumns: %s\\nRecent inv: %s\\n\\nFamily: %s\\nRecent fam: %s\\nFam cmds in msgs: %s" % (users, msgs, inv, col_str, str(recent), fam_count, str(fam_recent), str(fam_msgs)), 200'''
-code = code.replace(old_debug, new_debug)
+# 2. Добавить обработку REMOVE_FAMILY в process_gpt_commands (после SHARE обработки)
+old_share_block = '''        for sh in re.findall(SHARE_RE, text):'''
+new_share_block = '''        for fam_del in re.findall(REM_FAM_RE, text):
+            fname = fam_del.strip()
+            if fname:
+                c.execute("DELETE FROM family WHERE user_id = %s AND LOWER(name) = LOWER(%s)", (uid, fname))
+                logger.info("Deleted family member: %s for user %s", fname, uid)
 
-# 2. Усилить очистку шаблонов при init_db
-old_fam_clean = '''        c.execute("DELETE FROM family WHERE name IN ('имя','name','test') OR gender IN ('пол','gender') OR relation IN ('отношение','relation')")'''
-new_fam_clean = '''        c.execute("DELETE FROM family WHERE name IN ('имя','name','test','член_семьи','member') OR gender IN ('пол','gender') OR relation IN ('отношение','relation','родство') OR age = 0")'''
-code = code.replace(old_fam_clean, new_fam_clean)
+        for sh in re.findall(SHARE_RE, text):'''
+code = code.replace(old_share_block, new_share_block)
 
-# 3. Добавить fallback для ADD_FAMILY (как сделали для ADD_MEDICINE)
-old_fallback_end = '''        process_gpt_commands(uid, reply)
-        return clean_commands(reply)'''
+# 3. Добавить REMOVE_FAMILY в clean_commands
+old_clean = '    for rx in [ADD_MED_RE, REM_MED_RE, ADD_FAM_RE, ADD_REM_RE, SHARE_RE, CABINET_CREATE_RE, CABINET_SWITCH_RE]:'
+new_clean = '    for rx in [ADD_MED_RE, REM_MED_RE, ADD_FAM_RE, ADD_REM_RE, SHARE_RE, CABINET_CREATE_RE, CABINET_SWITCH_RE, REM_FAM_RE]:'
+code = code.replace(old_clean, new_clean)
 
-new_fallback_end = '''        # Если GPT не включил команду ADD_FAMILY но явно добавляет члена семьи
-        if "[ADD_FAMILY:" not in reply and any(w in reply.lower() for w in ["добавил", "добавила", "записал", "добавляю", "внёс", "внес"]):
-            if any(w in reply.lower() for w in ["семь", "член", "родствен", "ребён", "ребен", "муж", "жен", "сын", "дочь", "мам", "пап", "бабушк", "дедушк"]):
-                logger.info("GPT forgot ADD_FAMILY command, checking text")
-                import re as _re2
-                # Ищем имя в жирном
-                name_m = _re2.search(r'\\*\\*(.+?)\\*\\*', reply)
-                if name_m:
-                    fam_name = name_m.group(1)
-                    age_m = _re2.search(r'(\\d+)\\s*(?:лет|год|года)', reply)
-                    age = age_m.group(1) if age_m else ""
-                    gender = ""
-                    if any(w in reply.lower() for w in ["жена", "дочь", "мама", "бабушка", "сестра", "девочка"]): gender = "Ж"
-                    elif any(w in reply.lower() for w in ["муж", "сын", "папа", "дедушка", "брат", "мальчик"]): gender = "М"
-                    relation = ""
-                    for rel_word, rel_val in [("жена","жена"),("муж","муж"),("сын","сын"),("дочь","дочь"),("мама","мама"),("папа","папа"),("бабушка","бабушка"),("дедушка","дедушка"),("брат","брат"),("сестра","сестра"),("ребёнок","ребёнок"),("ребенок","ребёнок")]:
-                        if rel_word in reply.lower():
-                            relation = rel_val
+# 4. Добавить REMOVE_FAMILY в системный промпт
+old_cmd = '[REMOVE_MEDICINE:название] - удалить.'
+new_cmd = '''[REMOVE_MEDICINE:название] - удалить лекарство.
+[REMOVE_FAMILY:имя] - удалить члена семьи.'''
+code = code.replace(old_cmd, new_cmd)
+
+# 5. Убить fallback который путает семью с лекарствами — 
+#    заменить ADD_MEDICINE fallback на более точный (исключить имена людей)
+old_fallback = '''        # Если GPT не включил команду ADD_MEDICINE но явно добавляет лекарство
+        if "[ADD_MEDICINE:" not in reply and any(w in reply.lower() for w in ["добавляю", "добавил", "добавлено", "записал", "внесл"]):
+            logger.info("GPT forgot ADD_MEDICINE command, attempting fallback parse")
+            # Попробуем извлечь данные из текста
+            import re as _re
+            name_match = _re.search(r'\\*\\*(.+?)\\*\\*', reply)
+            if name_match:
+                med_name = name_match.group(1)
+                # Ищем дозировку
+                dose_match = _re.search(r'дозировк[аи]:?\\s*([\\d,.]+ ?(?:мг|мл|г|мкг|%|МЕ))', reply, _re.IGNORECASE)
+                dose = dose_match.group(1) if dose_match else ""
+                # Ищем срок
+                exp_match = _re.search(r'(?:годност|срок)[а-яё]*:?\\s*(\\d{4}[-./]\\d{2}(?:[-./]\\d{2})?)', reply, _re.IGNORECASE)
+                exp = exp_match.group(1) if exp_match else ""
+                # Ищем категорию
+                cat = "РАЗНОЕ"
+                for c_name in ["ТЕМПЕРАТУРА", "БОЛЬ", "ЖИВОТ", "РАНЫ"]:
+                    if c_name.lower() in reply.lower() or c_name in reply:
+                        cat = c_name
+                        break
+                # Ищем хранение
+                storage = "ХОЛОДИЛЬНИК" if "холодильник" in reply.lower() else "КОМНАТНАЯ"
+                cmd = "[ADD_MEDICINE:%s|1|%s|%s|%s|%s]" % (med_name, dose, exp, cat, storage)
+                logger.info("Fallback ADD command: %s", cmd)
+                reply += "\\n" + cmd'''
+
+new_fallback = '''        # Если GPT не включил команду ADD_MEDICINE но явно добавляет лекарство
+        family_words = ["семь", "член", "сын", "дочь", "муж", "жен", "мам", "пап", "бабушк", "дедушк", "ребён", "ребен", "брат", "сестр"]
+        is_family_context = any(w in reply.lower() for w in family_words)
+        if "[ADD_MEDICINE:" not in reply and not is_family_context and any(w in reply.lower() for w in ["добавляю", "добавил", "добавлено", "записал", "внесл"]):
+            # Проверяем что это именно лекарство (есть дозировка или мед. термины)
+            med_indicators = ["мг", "мл", "табл", "капсул", "дозировк", "годност", "срок", "категори", "аптечк"]
+            if any(ind in reply.lower() for ind in med_indicators):
+                logger.info("GPT forgot ADD_MEDICINE command, attempting fallback parse")
+                import re as _re
+                name_match = _re.search(r'\\*\\*(.+?)\\*\\*', reply)
+                if name_match:
+                    med_name = name_match.group(1)
+                    dose_match = _re.search(r'дозировк[аи]:?\\s*([\\d,.]+ ?(?:мг|мл|г|мкг|%|МЕ))', reply, _re.IGNORECASE)
+                    dose = dose_match.group(1) if dose_match else ""
+                    exp_match = _re.search(r'(?:годност|срок)[а-яё]*:?\\s*(\\d{4}[-./]\\d{2}(?:[-./]\\d{2})?)', reply, _re.IGNORECASE)
+                    exp = exp_match.group(1) if exp_match else ""
+                    cat = "РАЗНОЕ"
+                    for c_name in ["ТЕМПЕРАТУРА", "БОЛЬ", "ЖИВОТ", "РАНЫ"]:
+                        if c_name.lower() in reply.lower() or c_name in reply:
+                            cat = c_name
                             break
-                    cmd = "[ADD_FAMILY:%s|%s|%s|%s]" % (fam_name, age, gender, relation)
-                    logger.info("Fallback FAMILY command: %s", cmd)
-                    reply += "\\n" + cmd
+                    storage = "ХОЛОДИЛЬНИК" if "холодильник" in reply.lower() else "КОМНАТНАЯ"
+                    cmd = "[ADD_MEDICINE:%s|1|%s|%s|%s|%s]" % (med_name, dose, exp, cat, storage)
+                    logger.info("Fallback ADD command: %s", cmd)
+                    reply += "\\n" + cmd'''
+code = code.replace(old_fallback, new_fallback)
 
-        process_gpt_commands(uid, reply)
-        return clean_commands(reply)'''
-code = code.replace(old_fallback_end, new_fallback_end)
+# 6. Добавить эндпоинт для очистки мусора из базы
+old_debug_route = '@app.route("/debug_db", methods=["GET"])'
+new_cleanup_route = '''@app.route("/cleanup_db", methods=["GET"])
+def cleanup_db():
+    conn = get_db_connection()
+    if not conn:
+        return "DB connection FAILED", 500
+    try:
+        c = conn.cursor()
+        # Удалить не-лекарства из inventory
+        c.execute("DELETE FROM inventory WHERE LOWER(medicine_name) IN ('лев', 'циньян', 'ян', 'анна')")
+        inv_del = c.rowcount
+        # Удалить дубли из family
+        c.execute("""DELETE FROM family WHERE id NOT IN (
+            SELECT MIN(id) FROM family GROUP BY user_id, LOWER(name)
+        )""")
+        fam_dedup = c.rowcount
+        # Удалить шаблонные записи
+        c.execute("DELETE FROM family WHERE LOWER(name) IN ('имя','name','test','член_семьи')")
+        fam_tpl = c.rowcount
+        conn.commit()
+        return "Cleanup done. Inv removed: %s, Family deduped: %s, Family templates: %s" % (inv_del, fam_dedup, fam_tpl), 200
+    except Exception as e:
+        return "Error: %s" % str(e), 500
+    finally:
+        conn.close()
 
-# 4. Усилить промпт для семьи
-old_family_prompt = 'Аналогично для удаления ОБЯЗАТЕЛЬНО используй [REMOVE_MEDICINE:название], для семьи [ADD_FAMILY:...], для напоминаний [ADD_REMINDER:...]."""'
-new_family_prompt = '''Аналогично для удаления ОБЯЗАТЕЛЬНО используй [REMOVE_MEDICINE:название].
-Для добавления члена семьи ОБЯЗАТЕЛЬНО используй [ADD_FAMILY:имя|возраст|пол|отношение]. Пример: [ADD_FAMILY:Анна|30|Ж|жена]
-Для напоминаний ОБЯЗАТЕЛЬНО используй [ADD_REMINDER:...].
-НИКОГДА не используй шаблонные значения типа "имя", "возраст", "пол", "отношение" - только реальные данные от пользователя!"""'''
-code = code.replace(old_family_prompt, new_family_prompt)
-
-# 5. Добавить защиту от шаблонных значений в process_gpt_commands для family
-old_fam_insert = '''            if name:
-                c.execute("INSERT INTO family (user_id, name, age, gender, relation) VALUES (%s,%s,%s,%s,%s)", (uid, name, age, gender, relation))'''
-new_fam_insert = '''            # Проверка на шаблонные значения
-            bad_values = ['имя', 'name', 'test', 'член_семьи', 'member', 'пол', 'gender', 'отношение', 'relation', 'возраст']
-            if name and name.lower() not in bad_values:
-                if gender and gender.lower() in bad_values: gender = None
-                if relation and relation.lower() in bad_values: relation = None
-                # Проверяем дубликат
-                c.execute("SELECT id FROM family WHERE user_id = %s AND LOWER(name) = LOWER(%s)", (uid, name))
-                existing = c.fetchone()
-                if existing:
-                    c.execute("UPDATE family SET age=%s, gender=%s, relation=%s WHERE id=%s", (age, gender, relation, existing[0]))
-                    logger.info("Updated family member: %s for user %s", name, uid)
-                else:
-                    c.execute("INSERT INTO family (user_id, name, age, gender, relation) VALUES (%s,%s,%s,%s,%s)", (uid, name, age, gender, relation))
-                    logger.info("Added family member: %s for user %s", name, uid)'''
-code = code.replace(old_fam_insert, new_fam_insert)
+@app.route("/debug_db", methods=["GET"])'''
+code = code.replace(old_debug_route, new_cleanup_route)
 
 with open("bot.py", "w", encoding="utf-8") as f:
     f.write(code)

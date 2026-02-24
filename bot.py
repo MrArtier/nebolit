@@ -295,7 +295,8 @@ SYSTEM_PROMPT = """Ты умный и дружелюбный помощник п
 Поле хранение: ХОЛОДИЛЬНИК или КОМНАТНАЯ. Определяй сам на основе знаний о лекарстве. Лекарства, требующие холодильника: инсулин, свечи (суппозитории), многие глазные капли, вакцины, интерфероны, некоторые мази, живые пробиотики (Линекс, Бифидумбактерин), Виферон свечи, оксолиновая мазь и др. Если сомневаешься — ставь КОМНАТНАЯ.
 
 КАТЕГОРИИ определяй сам: ТЕМПЕРАТУРА, БОЛЬ, ЖИВОТ, РАНЫ, РАЗНОЕ. НИКОГДА не спрашивай категорию.
-[REMOVE_MEDICINE:название] - удалить.
+[REMOVE_MEDICINE:название] - удалить лекарство.
+[REMOVE_FAMILY:имя] - удалить члена семьи.
 [ADD_FAMILY:имя|возраст|пол|отношение] - добавить семью.
 [ADD_REMINDER:член_семьи|лекарство|время_приёма|до/после/во_время еды|дозировка|дней_курса|таблеток_за_приём|таблеток_в_пачке] - напоминание. Бессрочно = дней_курса 0.
 [CREATE_CABINET:название] - создать аптечку.
@@ -360,30 +361,30 @@ def generate_gpt_response(uid, user_text):
         resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages, max_tokens=1000, temperature=0.7)
         reply = resp.choices[0].message.content
         # Если GPT не включил команду ADD_MEDICINE но явно добавляет лекарство
-        if "[ADD_MEDICINE:" not in reply and any(w in reply.lower() for w in ["добавляю", "добавил", "добавлено", "записал", "внесл"]):
-            logger.info("GPT forgot ADD_MEDICINE command, attempting fallback parse")
-            # Попробуем извлечь данные из текста
-            import re as _re
-            name_match = _re.search(r'\*\*(.+?)\*\*', reply)
-            if name_match:
-                med_name = name_match.group(1)
-                # Ищем дозировку
-                dose_match = _re.search(r'дозировк[аи]:?\s*([\d,.]+ ?(?:мг|мл|г|мкг|%|МЕ))', reply, _re.IGNORECASE)
-                dose = dose_match.group(1) if dose_match else ""
-                # Ищем срок
-                exp_match = _re.search(r'(?:годност|срок)[а-яё]*:?\s*(\d{4}[-./]\d{2}(?:[-./]\d{2})?)', reply, _re.IGNORECASE)
-                exp = exp_match.group(1) if exp_match else ""
-                # Ищем категорию
-                cat = "РАЗНОЕ"
-                for c_name in ["ТЕМПЕРАТУРА", "БОЛЬ", "ЖИВОТ", "РАНЫ"]:
-                    if c_name.lower() in reply.lower() or c_name in reply:
-                        cat = c_name
-                        break
-                # Ищем хранение
-                storage = "ХОЛОДИЛЬНИК" if "холодильник" in reply.lower() else "КОМНАТНАЯ"
-                cmd = "[ADD_MEDICINE:%s|1|%s|%s|%s|%s]" % (med_name, dose, exp, cat, storage)
-                logger.info("Fallback ADD command: %s", cmd)
-                reply += "\n" + cmd
+        family_words = ["семь", "член", "сын", "дочь", "муж", "жен", "мам", "пап", "бабушк", "дедушк", "ребён", "ребен", "брат", "сестр"]
+        is_family_context = any(w in reply.lower() for w in family_words)
+        if "[ADD_MEDICINE:" not in reply and not is_family_context and any(w in reply.lower() for w in ["добавляю", "добавил", "добавлено", "записал", "внесл"]):
+            # Проверяем что это именно лекарство (есть дозировка или мед. термины)
+            med_indicators = ["мг", "мл", "табл", "капсул", "дозировк", "годност", "срок", "категори", "аптечк"]
+            if any(ind in reply.lower() for ind in med_indicators):
+                logger.info("GPT forgot ADD_MEDICINE command, attempting fallback parse")
+                import re as _re
+                name_match = _re.search(r'\*\*(.+?)\*\*', reply)
+                if name_match:
+                    med_name = name_match.group(1)
+                    dose_match = _re.search(r'дозировк[аи]:?\s*([\d,.]+ ?(?:мг|мл|г|мкг|%|МЕ))', reply, _re.IGNORECASE)
+                    dose = dose_match.group(1) if dose_match else ""
+                    exp_match = _re.search(r'(?:годност|срок)[а-яё]*:?\s*(\d{4}[-./]\d{2}(?:[-./]\d{2})?)', reply, _re.IGNORECASE)
+                    exp = exp_match.group(1) if exp_match else ""
+                    cat = "РАЗНОЕ"
+                    for c_name in ["ТЕМПЕРАТУРА", "БОЛЬ", "ЖИВОТ", "РАНЫ"]:
+                        if c_name.lower() in reply.lower() or c_name in reply:
+                            cat = c_name
+                            break
+                    storage = "ХОЛОДИЛЬНИК" if "холодильник" in reply.lower() else "КОМНАТНАЯ"
+                    cmd = "[ADD_MEDICINE:%s|1|%s|%s|%s|%s]" % (med_name, dose, exp, cat, storage)
+                    logger.info("Fallback ADD command: %s", cmd)
+                    reply += "\n" + cmd
         # Если GPT не включил команду ADD_FAMILY но явно добавляет члена семьи
         if "[ADD_FAMILY:" not in reply and any(w in reply.lower() for w in ["добавил", "добавила", "записал", "добавляю", "внёс", "внес"]):
             if any(w in reply.lower() for w in ["семь", "член", "родствен", "ребён", "ребен", "муж", "жен", "сын", "дочь", "мам", "пап", "бабушк", "дедушк"]):
@@ -418,6 +419,8 @@ ADD_REM_RE = r"\[ADD_REMINDER:(.+?)\]"
 SHARE_RE = r"\[SHARE_ACCESS:(.+?)\]"
 CABINET_CREATE_RE = r"\[CREATE_CABINET:(.+?)\]"
 CABINET_SWITCH_RE = r"\[SWITCH_CABINET:(.+?)\]"
+REM_FAM_RE = r"\[REMOVE_FAMILY:(.+?)\]"
+REM_FAM_RE = r"\[REMOVE_FAMILY:(.+?)\]"
 
 def process_gpt_commands(uid, text):
     conn = get_db_connection()
@@ -489,6 +492,18 @@ def process_gpt_commands(uid, text):
                     c.execute("INSERT INTO user_state (user_id, active_cabinet_id) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET active_cabinet_id = %s", (uid, row[0], row[0]))
                 elif cab_name.lower() in ("моя аптечка", "своя", "моя", "основная"):
                     c.execute("INSERT INTO user_state (user_id, active_cabinet_id) VALUES (%s, 0) ON CONFLICT (user_id) DO UPDATE SET active_cabinet_id = 0", (uid,))
+        for fam_del in re.findall(REM_FAM_RE, text):
+            fname = fam_del.strip()
+            if fname:
+                c.execute("DELETE FROM family WHERE user_id = %s AND LOWER(name) = LOWER(%s)", (uid, fname))
+                logger.info("Deleted family member: %s for user %s", fname, uid)
+
+        for fam_del in re.findall(REM_FAM_RE, text):
+            fname = fam_del.strip()
+            if fname:
+                c.execute("DELETE FROM family WHERE user_id = %s AND LOWER(name) = LOWER(%s)", (uid, fname))
+                logger.info("Deleted family member: %s for user %s", fname, uid)
+
         for sh in re.findall(SHARE_RE, text):
             parts = [p.strip() for p in sh.split("|")]
             username = parts[0].replace("@", "") if len(parts) > 0 else ""
@@ -529,7 +544,7 @@ def process_gpt_commands(uid, text):
     finally: conn.close()
 
 def clean_commands(text):
-    for rx in [ADD_MED_RE, REM_MED_RE, ADD_FAM_RE, ADD_REM_RE, SHARE_RE, CABINET_CREATE_RE, CABINET_SWITCH_RE]:
+    for rx in [ADD_MED_RE, REM_MED_RE, ADD_FAM_RE, ADD_REM_RE, SHARE_RE, CABINET_CREATE_RE, CABINET_SWITCH_RE, REM_FAM_RE]:
         text = re.sub(rx, "", text)
     return text.strip()
 
@@ -966,6 +981,56 @@ def webhook():
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
+
+@app.route("/cleanup_db", methods=["GET"])
+def cleanup_db():
+    conn = get_db_connection()
+    if not conn:
+        return "DB connection FAILED", 500
+    try:
+        c = conn.cursor()
+        # Удалить не-лекарства из inventory
+        c.execute("DELETE FROM inventory WHERE LOWER(medicine_name) IN ('лев', 'циньян', 'ян', 'анна')")
+        inv_del = c.rowcount
+        # Удалить дубли из family
+        c.execute("""DELETE FROM family WHERE id NOT IN (
+            SELECT MIN(id) FROM family GROUP BY user_id, LOWER(name)
+        )""")
+        fam_dedup = c.rowcount
+        # Удалить шаблонные записи
+        c.execute("DELETE FROM family WHERE LOWER(name) IN ('имя','name','test','член_семьи')")
+        fam_tpl = c.rowcount
+        conn.commit()
+        return "Cleanup done. Inv removed: %s, Family deduped: %s, Family templates: %s" % (inv_del, fam_dedup, fam_tpl), 200
+    except Exception as e:
+        return "Error: %s" % str(e), 500
+    finally:
+        conn.close()
+
+@app.route("/cleanup_db", methods=["GET"])
+def cleanup_db():
+    conn = get_db_connection()
+    if not conn:
+        return "DB connection FAILED", 500
+    try:
+        c = conn.cursor()
+        # Удалить не-лекарства из inventory
+        c.execute("DELETE FROM inventory WHERE LOWER(medicine_name) IN ('лев', 'циньян', 'ян', 'анна')")
+        inv_del = c.rowcount
+        # Удалить дубли из family
+        c.execute("""DELETE FROM family WHERE id NOT IN (
+            SELECT MIN(id) FROM family GROUP BY user_id, LOWER(name)
+        )""")
+        fam_dedup = c.rowcount
+        # Удалить шаблонные записи
+        c.execute("DELETE FROM family WHERE LOWER(name) IN ('имя','name','test','член_семьи')")
+        fam_tpl = c.rowcount
+        conn.commit()
+        return "Cleanup done. Inv removed: %s, Family deduped: %s, Family templates: %s" % (inv_del, fam_dedup, fam_tpl), 200
+    except Exception as e:
+        return "Error: %s" % str(e), 500
+    finally:
+        conn.close()
 
 @app.route("/debug_db", methods=["GET"])
 def debug_db():
