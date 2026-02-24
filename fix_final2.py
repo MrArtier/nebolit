@@ -1,4 +1,4 @@
-import os, logging, io, re, tempfile, base64, json, urllib.request, psycopg2
+code = r'''import os, logging, io, re, tempfile, base64, json, urllib.request, psycopg2
 from flask import Flask, request as flask_request
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -348,13 +348,20 @@ def generate_gpt_response(uid, user_text):
         return clean_commands(reply)
     except Exception as e: logger.error("GPT err: %s", e); return "Ошибка связи с ИИ."
 
-ADD_MED_RE = r"\[ADD_MEDICINE:(.+?)\]"
-REM_MED_RE = r"\[REMOVE_MEDICINE:(.+?)\]"
-ADD_FAM_RE = r"\[ADD_FAMILY:(.+?)\]"
-ADD_REM_RE = r"\[ADD_REMINDER:(.+?)\]"
-SHARE_RE = r"\[SHARE_ACCESS:(.+?)\]"
-CABINET_CREATE_RE = r"\[CREATE_CABINET:(.+?)\]"
-CABINET_SWITCH_RE = r"\[SWITCH_CABINET:(.+?)\]"
+ADD_MED_RE = r"
+\[ADD_MEDICINE:(.+?)\]"
+REM_MED_RE = r"
+\[REMOVE_MEDICINE:(.+?)\]"
+ADD_FAM_RE = r"
+\[ADD_FAMILY:(.+?)\]"
+ADD_REM_RE = r"
+\[ADD_REMINDER:(.+?)\]"
+SHARE_RE = r"
+\[SHARE_ACCESS:(.+?)\]"
+CABINET_CREATE_RE = r"
+\[CREATE_CABINET:(.+?)\]"
+CABINET_SWITCH_RE = r"
+\[SWITCH_CABINET:(.+?)\]"
 
 def process_gpt_commands(uid, text):
     conn = get_db_connection()
@@ -900,3 +907,8 @@ except Exception as e:
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+'''
+
+with open('bot.py', 'w', encoding='utf-8') as f:
+    f.write(code)
+print('Done! Clean bot.py written.')
