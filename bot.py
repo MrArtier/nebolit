@@ -47,8 +47,9 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS reminder_log (id SERIAL PRIMARY KEY, reminder_id INTEGER REFERENCES reminders(id), sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, status TEXT DEFAULT 'sent')")
         try:
             c.execute("ALTER TABLE inventory ADD COLUMN IF NOT EXISTS storage TEXT DEFAULT ''")
+            conn.commit()
         except:
-            pass
+            conn.rollback()
         c.execute("DELETE FROM reminders WHERE medicine_name IN ('лекарство','medicine','test') OR family_member IN ('член_семьи','member')")
         c.execute("DELETE FROM family WHERE name IN ('имя','name','test') OR gender IN ('пол','gender') OR relation IN ('отношение','relation')")
         conn.commit()
@@ -102,7 +103,10 @@ def save_user(uid, uname):
         c = conn.cursor()
         c.execute("INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET username = %s", (uid, uname, uname))
         conn.commit()
-    except Exception as e: logger.error("Save user err: %s", e)
+    except Exception as e:
+        logger.error("Save user err: %s", e, exc_info=True)
+        try: conn.rollback()
+        except: pass
     finally: conn.close()
 
 def save_message(uid, role, content):
@@ -112,7 +116,10 @@ def save_message(uid, role, content):
         c = conn.cursor()
         c.execute("INSERT INTO messages (user_id, role, content) VALUES (%s, %s, %s)", (uid, role, content))
         conn.commit()
-    except Exception as e: logger.error("Save msg err: %s", e)
+    except Exception as e:
+        logger.error("Save msg err: %s", e, exc_info=True)
+        try: conn.rollback()
+        except: pass
     finally: conn.close()
 
 def get_user_history(uid, limit=20):
@@ -447,7 +454,10 @@ def process_gpt_commands(uid, text):
                 total_pills = course_days * times_per_day * pills_per_dose if course_days > 0 else 0
                 c.execute("INSERT INTO reminders (user_id, family_member, medicine_name, dosage, schedule_time, meal_relation, course_days, pills_per_dose, pills_in_pack, pills_remaining, start_date, end_date, active) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE)", (uid, member, medicine, dosage, schedule, meal, course_days, pills_per_dose, pills_in_pack, total_pills, start, end))
         conn.commit()
-    except Exception as e: logger.error("Cmd err: %s", e)
+    except Exception as e:
+        logger.error("Cmd err: %s", e, exc_info=True)
+        try: conn.rollback()
+        except: pass
     finally: conn.close()
 
 def clean_commands(text):
@@ -844,6 +854,7 @@ def handle_update(data):
     save_message(uid, "user", user_text)
     reply = generate_gpt_response(uid, user_text)
     save_message(uid, "assistant", reply)
+    logger.info("GPT reply for %s: %s", uid, reply[:300])
     tg_send(chat_id, reply)
 
     # Cleanup recognition messages after response
@@ -887,6 +898,30 @@ def webhook():
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
+
+@app.route("/debug_db", methods=["GET"])
+def debug_db():
+    conn = get_db_connection()
+    if not conn:
+        return "DB connection FAILED", 500
+    try:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        users = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM messages")
+        msgs = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM inventory")
+        inv = c.fetchone()[0]
+        c.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'inventory' ORDER BY ordinal_position")
+        cols = c.fetchall()
+        col_str = ", ".join(["%s(%s)" % (c[0], c[1]) for c in cols])
+        c.execute("SELECT * FROM inventory ORDER BY id DESC LIMIT 3")
+        recent = c.fetchall()
+        return "DB OK. Users: %s, Msgs: %s, Inv: %s\nColumns: %s\nRecent: %s" % (users, msgs, inv, col_str, str(recent)), 200
+    except Exception as e:
+        return "DB error: %s" % str(e), 500
+    finally:
+        conn.close()
 
 @app.route("/", methods=["GET"])
 def index():
