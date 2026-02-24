@@ -52,7 +52,7 @@ def init_db():
             conn.rollback()
         c.execute("DELETE FROM reminders WHERE medicine_name IN ('лекарство','medicine','test') OR family_member IN ('член_семьи','member')")
         c.execute("DELETE FROM inventory WHERE dosage = 'дозировка' OR category = 'категория' OR medicine_name IN ('лекарство','medicine','test')")
-        c.execute("DELETE FROM family WHERE name IN ('имя','name','test') OR gender IN ('пол','gender') OR relation IN ('отношение','relation')")
+        c.execute("DELETE FROM family WHERE name IN ('имя','name','test','член_семьи','member') OR gender IN ('пол','gender') OR relation IN ('отношение','relation','родство') OR age = 0")
         conn.commit()
         logger.info("DB init OK")
     except Exception as e:
@@ -308,7 +308,10 @@ SYSTEM_PROMPT = """Ты умный и дружелюбный помощник п
 
 КРИТИЧЕСКИ ВАЖНО: Когда пользователь просит добавить лекарство (текстом, голосом или фото) — ты ОБЯЗАН включить команду [ADD_MEDICINE:...] в свой ответ. Без этой команды лекарство НЕ будет добавлено в аптечку! Всегда используй команды в квадратных скобках. Пример: [ADD_MEDICINE:Нурофен|1|400 мг|2027-01|БОЛЬ|КОМНАТНАЯ]
 
-Аналогично для удаления ОБЯЗАТЕЛЬНО используй [REMOVE_MEDICINE:название], для семьи [ADD_FAMILY:...], для напоминаний [ADD_REMINDER:...]."""
+Аналогично для удаления ОБЯЗАТЕЛЬНО используй [REMOVE_MEDICINE:название].
+Для добавления члена семьи ОБЯЗАТЕЛЬНО используй [ADD_FAMILY:имя|возраст|пол|отношение]. Пример: [ADD_FAMILY:Анна|30|Ж|жена]
+Для напоминаний ОБЯЗАТЕЛЬНО используй [ADD_REMINDER:...].
+НИКОГДА не используй шаблонные значения типа "имя", "возраст", "пол", "отношение" - только реальные данные от пользователя!"""
 
 def generate_gpt_response(uid, user_text):
     from openai import OpenAI
@@ -381,6 +384,29 @@ def generate_gpt_response(uid, user_text):
                 cmd = "[ADD_MEDICINE:%s|1|%s|%s|%s|%s]" % (med_name, dose, exp, cat, storage)
                 logger.info("Fallback ADD command: %s", cmd)
                 reply += "\n" + cmd
+        # Если GPT не включил команду ADD_FAMILY но явно добавляет члена семьи
+        if "[ADD_FAMILY:" not in reply and any(w in reply.lower() for w in ["добавил", "добавила", "записал", "добавляю", "внёс", "внес"]):
+            if any(w in reply.lower() for w in ["семь", "член", "родствен", "ребён", "ребен", "муж", "жен", "сын", "дочь", "мам", "пап", "бабушк", "дедушк"]):
+                logger.info("GPT forgot ADD_FAMILY command, checking text")
+                import re as _re2
+                # Ищем имя в жирном
+                name_m = _re2.search(r'\*\*(.+?)\*\*', reply)
+                if name_m:
+                    fam_name = name_m.group(1)
+                    age_m = _re2.search(r'(\d+)\s*(?:лет|год|года)', reply)
+                    age = age_m.group(1) if age_m else ""
+                    gender = ""
+                    if any(w in reply.lower() for w in ["жена", "дочь", "мама", "бабушка", "сестра", "девочка"]): gender = "Ж"
+                    elif any(w in reply.lower() for w in ["муж", "сын", "папа", "дедушка", "брат", "мальчик"]): gender = "М"
+                    relation = ""
+                    for rel_word, rel_val in [("жена","жена"),("муж","муж"),("сын","сын"),("дочь","дочь"),("мама","мама"),("папа","папа"),("бабушка","бабушка"),("дедушка","дедушка"),("брат","брат"),("сестра","сестра"),("ребёнок","ребёнок"),("ребенок","ребёнок")]:
+                        if rel_word in reply.lower():
+                            relation = rel_val
+                            break
+                    cmd = "[ADD_FAMILY:%s|%s|%s|%s]" % (fam_name, age, gender, relation)
+                    logger.info("Fallback FAMILY command: %s", cmd)
+                    reply += "\n" + cmd
+
         process_gpt_commands(uid, reply)
         return clean_commands(reply)
     except Exception as e: logger.error("GPT err: %s", e); return "Ошибка связи с ИИ."
@@ -434,8 +460,20 @@ def process_gpt_commands(uid, text):
                 except: age = None
             gender = parts[2] if len(parts) > 2 else None
             relation = parts[3] if len(parts) > 3 else None
-            if name:
-                c.execute("INSERT INTO family (user_id, name, age, gender, relation) VALUES (%s,%s,%s,%s,%s)", (uid, name, age, gender, relation))
+            # Проверка на шаблонные значения
+            bad_values = ['имя', 'name', 'test', 'член_семьи', 'member', 'пол', 'gender', 'отношение', 'relation', 'возраст']
+            if name and name.lower() not in bad_values:
+                if gender and gender.lower() in bad_values: gender = None
+                if relation and relation.lower() in bad_values: relation = None
+                # Проверяем дубликат
+                c.execute("SELECT id FROM family WHERE user_id = %s AND LOWER(name) = LOWER(%s)", (uid, name))
+                existing = c.fetchone()
+                if existing:
+                    c.execute("UPDATE family SET age=%s, gender=%s, relation=%s WHERE id=%s", (age, gender, relation, existing[0]))
+                    logger.info("Updated family member: %s for user %s", name, uid)
+                else:
+                    c.execute("INSERT INTO family (user_id, name, age, gender, relation) VALUES (%s,%s,%s,%s,%s)", (uid, name, age, gender, relation))
+                    logger.info("Added family member: %s for user %s", name, uid)
         for cab in re.findall(CABINET_CREATE_RE, text):
             cab_name = cab.strip()
             if cab_name:
@@ -947,7 +985,13 @@ def debug_db():
         col_str = ", ".join(["%s(%s)" % (c[0], c[1]) for c in cols])
         c.execute("SELECT * FROM inventory ORDER BY id DESC LIMIT 3")
         recent = c.fetchall()
-        return "DB OK. Users: %s, Msgs: %s, Inv: %s\nColumns: %s\nRecent: %s" % (users, msgs, inv, col_str, str(recent)), 200
+        c.execute("SELECT COUNT(*) FROM family")
+        fam_count = c.fetchone()[0]
+        c.execute("SELECT * FROM family ORDER BY id DESC LIMIT 10")
+        fam_recent = c.fetchall()
+        c.execute("SELECT content FROM messages WHERE content LIKE '%%ADD_FAMILY%%' ORDER BY id DESC LIMIT 5")
+        fam_msgs = c.fetchall()
+        return "DB OK. Users: %s, Msgs: %s, Inv: %s\nColumns: %s\nRecent inv: %s\n\nFamily: %s\nRecent fam: %s\nFam cmds in msgs: %s" % (users, msgs, inv, col_str, str(recent), fam_count, str(fam_recent), str(fam_msgs)), 200
     except Exception as e:
         return "DB error: %s" % str(e), 500
     finally:
